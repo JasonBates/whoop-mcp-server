@@ -151,7 +151,7 @@ async def get_sleep_trend(days: int = 7) -> str:
 
         lines = [f"Sleep Trend (last {len(main_sleeps)} nights):", ""]
 
-        for record in main_sleeps:
+        for record in reversed(main_sleeps):
             if record.score_state == "SCORED" and record.score:
                 stages = record.score.stage_summary
                 hours = stages.total_sleep_hours
@@ -202,7 +202,7 @@ async def get_recovery_trend(days: int = 7) -> str:
 
         lines = [f"Recovery Trend (last {len(records)} days):", ""]
 
-        for record in records:
+        for record in reversed(records):
             if record.score_state == "SCORED" and record.score:
                 score = record.score.recovery_score
                 hrv = record.score.hrv_rmssd_milli
