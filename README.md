@@ -125,7 +125,7 @@ The server automatically refreshes tokens, but if you encounter persistent auth 
 
 ### Multiple machines
 
-Each machine must authorize separately with WHOOP. You cannot copy `.env` tokens between machines because when one machine refreshes the token (which happens automatically every ~55 minutes), it invalidates the token on the other machine. Run `uv run python scripts/get_tokens.py` on each machine you want to use.
+Each machine must authorize separately with WHOOP. You cannot copy `.env` tokens between machines because when a machine refreshes the token, it invalidates the token on the other machine. Tokens are refreshed proactively before they expire (after ~55 minutes of use). Run `uv run python scripts/get_tokens.py` on each machine you want to use.
 
 ### Rate limiting
 
