@@ -156,14 +156,14 @@ async def get_sleep_trend(days: int = 7) -> str:
                 stages = record.score.stage_summary
                 hours = stages.total_sleep_hours
                 perf = record.score.sleep_performance_percentage or 0
-                date = record.start.strftime("%m/%d")
+                date = record.end.strftime("%m/%d")
 
                 # Visual bar based on hours (8h = full bar)
                 filled = min(int(hours * 10 / 8), 10)
                 bar = "█" * filled + "░" * (10 - filled)
                 lines.append(f"{date}: {bar} {hours:.1f}h ({perf:.0f}% perf)")
             else:
-                date = record.start.strftime("%m/%d")
+                date = record.end.strftime("%m/%d")
                 lines.append(f"{date}: [not scored]")
 
         # Calculate averages
