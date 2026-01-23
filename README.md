@@ -22,7 +22,8 @@ An MCP (Model Context Protocol) server that provides Claude Desktop with access 
 ### 1. Clone and Install
 
 ```bash
-cd ~/Projects/whoop-mcp
+git clone https://github.com/JasonBates/whoop-mcp-server.git
+cd whoop-mcp-server
 uv sync
 ```
 
@@ -76,7 +77,7 @@ Add the server to your Claude Desktop config at:
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/YOUR_USERNAME/Projects/whoop-mcp",
+        "/path/to/whoop-mcp-server",
         "run",
         "python",
         "-m",
@@ -87,7 +88,7 @@ Add the server to your Claude Desktop config at:
 }
 ```
 
-Replace `YOUR_USERNAME` with your actual username.
+Replace `/path/to/whoop-mcp-server` with the full path where you cloned the repository.
 
 ### 6. Restart Claude Desktop
 
