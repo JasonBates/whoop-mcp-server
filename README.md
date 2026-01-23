@@ -129,7 +129,7 @@ Each machine must authorize separately with WHOOP. You cannot copy `.env` tokens
 
 ### Rate limiting
 
-WHOOP API allows 100 requests/minute and 10,000/day. The MCP server caches data appropriately to avoid hitting limits.
+WHOOP API allows 100 requests/minute and 10,000/day. Normal usage is unlikely to hit these limits.
 
 ## Development
 
