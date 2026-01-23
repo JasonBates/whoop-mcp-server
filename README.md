@@ -129,12 +129,6 @@ WHOOP API allows 100 requests/minute and 10,000/day. The MCP server caches data 
 ## Development
 
 ```bash
-# Install dev dependencies
-uv sync --dev
-
-# Run tests
-uv run pytest
-
 # Test with MCP Inspector
 npx @modelcontextprotocol/inspector uv run python -m whoop_mcp
 ```

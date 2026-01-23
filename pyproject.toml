@@ -13,11 +13,6 @@ dependencies = [
 [project.scripts]
 whoop-mcp = "whoop_mcp.server:main"
 
-[project.optional-dependencies]
-dev = [
-    "pytest",
-    "pytest-asyncio",
-]
 
 [build-system]
 requires = ["hatchling"]
