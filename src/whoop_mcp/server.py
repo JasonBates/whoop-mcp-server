@@ -17,13 +17,25 @@ Usage:
 """
 
 import asyncio
+from datetime import datetime
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from whoop_mcp.client import WhoopClient, WhoopAuthError, WhoopAPIError
 
 # Initialize the FastMCP server with a display name shown in Claude Desktop
 mcp = FastMCP("WHOOP Recovery")
+
+
+def _format_date(dt: datetime) -> str:
+    """Format a datetime as 'Day D Mon' e.g. 'Fri 7 Mar'."""
+    return dt.strftime("%a %-d %b")
+
+
+def _format_sleep_range(start: datetime, end: datetime) -> str:
+    """Format a sleep window e.g. 'Thu 6 Mar 22:47 → Fri 7 Mar 06:12'."""
+    return f"{start.strftime('%a %-d %b %H:%M')} → {end.strftime('%a %-d %b %H:%M')}"
 
 
 def format_hours_minutes(hours: float) -> str:
@@ -71,7 +83,8 @@ async def get_today_summary() -> str:
         # Recovery section
         # score_state can be: SCORED (data ready), PENDING_SCORE (processing),
         # or UNSCORABLE (not enough data, e.g., WHOOP wasn't worn)
-        lines.append("RECOVERY")
+        recovery_date = _format_date(recovery.created_at) if recovery else None
+        lines.append(f"RECOVERY (scored: {recovery_date})" if recovery_date else "RECOVERY")
         if recovery and recovery.score_state == "SCORED" and recovery.score:
             score = recovery.score
             lines.append(f"  Score: {score.recovery_score}%")
@@ -87,7 +100,8 @@ async def get_today_summary() -> str:
         lines.append("")
 
         # Sleep section
-        lines.append("SLEEP")
+        sleep_range = _format_sleep_range(sleep.start, sleep.end) if sleep else None
+        lines.append(f"SLEEP ({sleep_range})" if sleep_range else "SLEEP")
         if sleep and sleep.score_state == "SCORED" and sleep.score:
             score = sleep.score
             stages = score.stage_summary
@@ -106,24 +120,24 @@ async def get_today_summary() -> str:
         lines.append("")
 
         # Strain section
-        lines.append("STRAIN")
-        if cycles and cycles[0].score_state == "SCORED" and cycles[0].score:
-            score = cycles[0].score
+        cycle = cycles[0] if cycles else None
+        cycle_date = _format_date(cycle.start) if cycle else None
+        lines.append(f"STRAIN (cycle started: {cycle_date})" if cycle_date else "STRAIN")
+        if cycle and cycle.score_state == "SCORED" and cycle.score:
+            score = cycle.score
             calories = int(score.kilojoule * 0.239)
             lines.append(f"  Score: {score.strain:.1f} / 21")
             lines.append(f"  Calories: {calories} kcal")
             lines.append(f"  Avg HR: {score.average_heart_rate}bpm")
-        elif cycles and cycles[0].score_state != "SCORED":
-            lines.append(f"  {cycles[0].score_state.lower().replace('_', ' ')}")
+        elif cycle and cycle.score_state != "SCORED":
+            lines.append(f"  {cycle.score_state.lower().replace('_', ' ')}")
         else:
             lines.append("  Not available yet")
 
         return "\n".join(lines)
 
-    except WhoopAuthError as e:
-        return f"Authentication error: {e}. Run the token setup script."
-    except WhoopAPIError as e:
-        return f"API error: {e}"
+    except (WhoopAuthError, WhoopAPIError) as e:
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -177,10 +191,8 @@ async def get_sleep_trend(days: int = 7) -> str:
 
         return "\n".join(lines)
 
-    except WhoopAuthError as e:
-        return f"Authentication error: {e}. Run the token setup script."
-    except WhoopAPIError as e:
-        return f"API error: {e}"
+    except (WhoopAuthError, WhoopAPIError) as e:
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -226,10 +238,8 @@ async def get_recovery_trend(days: int = 7) -> str:
 
         return "\n".join(lines)
 
-    except WhoopAuthError as e:
-        return f"Authentication error: {e}. Run the token setup script."
-    except WhoopAPIError as e:
-        return f"API error: {e}"
+    except (WhoopAuthError, WhoopAPIError) as e:
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -287,10 +297,8 @@ async def get_workouts(limit: int = 5) -> str:
 
         return "\n".join(lines).strip()
 
-    except WhoopAuthError as e:
-        return f"Authentication error: {e}. Run the token setup script."
-    except WhoopAPIError as e:
-        return f"API error: {e}"
+    except (WhoopAuthError, WhoopAPIError) as e:
+        raise ToolError(str(e))
 
 
 # Entry point for running the server
