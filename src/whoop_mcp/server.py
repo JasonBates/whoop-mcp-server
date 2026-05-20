@@ -272,6 +272,7 @@ async def get_workouts(limit: int = 5) -> str:
                 s = w.score
                 workout_line = f"• {date} - {sport} ({duration_mins:.0f}min)"
                 lines.append(workout_line)
+                lines.append(f"  ID: {w.id}")
                 lines.append(f"  Strain: {s.strain:.1f} | {s.calories} cal | Avg HR: {s.average_heart_rate} bpm")
 
                 # Show distance if available
@@ -293,6 +294,7 @@ async def get_workouts(limit: int = 5) -> str:
                 lines.append("")
             else:
                 lines.append(f"• {date} - {sport} ({duration_mins:.0f}min) [not scored]")
+                lines.append(f"  ID: {w.id}")
                 lines.append("")
 
         return "\n".join(lines).strip()
