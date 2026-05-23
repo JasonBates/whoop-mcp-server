@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from dotenv import load_dotenv, set_key
+from dotenv import dotenv_values, load_dotenv, set_key
 
 from whoop_mcp.models import Recovery, Sleep, Cycle, Workout
 
@@ -93,6 +93,28 @@ class WhoopClient:
                 self.access_token = os.environ.get("WHOOP_ACCESS_TOKEN", self.access_token)
                 self.refresh_token = os.environ.get("WHOOP_REFRESH_TOKEN", self.refresh_token)
                 return
+
+            # Cross-process safety: a sibling whoop-mcp process (e.g. spawned
+            # by alix's 24h backend-restart timer while a webhook was in
+            # flight) may have rotated the refresh token after this process
+            # cached it at __init__. WHOOP refresh tokens are single-use —
+            # the server invalidates the old one on rotation — so issuing
+            # our refresh with a stale token leaves the agent wedged until
+            # manual re-auth.
+            #
+            # Observed live 2026-05-22T09:05Z (UTC): workout webhook +
+            # stale-backend restart raced. The new process kept stale RT1
+            # in memory for 10h until its next refresh, then failed with
+            # "Token refresh failed: invalid_request" and blocked the next
+            # morning's morning-checkin.
+            #
+            # Use dotenv_values (returns a dict, doesn't mutate os.environ)
+            # so tests can patch this hook without polluting global env state.
+            disk_vars = dotenv_values(ENV_PATH)
+            disk_refresh = disk_vars.get("WHOOP_REFRESH_TOKEN")
+            if disk_refresh and disk_refresh != self.refresh_token:
+                self.refresh_token = disk_refresh
+                self.access_token = disk_vars.get("WHOOP_ACCESS_TOKEN") or self.access_token
 
             if not self.refresh_token:
                 raise WhoopAuthError("No refresh token available. Re-run get_tokens.py")
