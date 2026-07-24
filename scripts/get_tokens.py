@@ -22,8 +22,22 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv, set_key
 
-# Load existing .env
-ENV_PATH = Path(__file__).parent.parent / ".env"
+def resolve_env_file() -> Path:
+    """Resolve the dotenv file to read creds from and write tokens to.
+
+    Honors $WHOOP_TOKEN_FILE so a dedicated consumer (e.g. the Alix harness)
+    can authorize into its own token file, keeping its rotating refresh-token
+    lineage separate from other processes that spawn this server. Mirrors
+    find_env_file() in whoop_mcp.client. Unset → the repo-root .env.
+    """
+    override = os.getenv("WHOOP_TOKEN_FILE")
+    if override and override.strip():
+        return Path(override).expanduser()
+    return Path(__file__).parent.parent / ".env"
+
+
+# Load existing .env (or the dedicated token file, if WHOOP_TOKEN_FILE is set)
+ENV_PATH = resolve_env_file()
 load_dotenv(ENV_PATH)
 
 # WHOOP OAuth Configuration

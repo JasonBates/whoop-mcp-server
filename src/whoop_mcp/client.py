@@ -14,7 +14,24 @@ from whoop_mcp.models import Recovery, Sleep, Cycle, Workout
 
 # Find .env file (check multiple locations)
 def find_env_file() -> Path:
-    """Find the .env file, checking multiple locations."""
+    """Resolve which dotenv file holds WHOOP credentials + tokens.
+
+    Priority:
+      1. $WHOOP_TOKEN_FILE (if set and non-empty) — lets independent consumers
+         keep separate, non-colliding refresh-token lineages. WHOOP rotates the
+         refresh token on every use and invalidates the prior one, so two
+         long-lived processes sharing a single token file (e.g. the Alix harness
+         and a conversational Claude Code agent, both spawning this server from
+         the same checkout) rotate each other's tokens out from under them and
+         eventually wedge until manual re-auth. A dedicated token file per
+         OAuth authorization avoids the collision entirely.
+      2. <project root>/.env
+      3. <cwd>/.env
+    """
+    override = os.getenv("WHOOP_TOKEN_FILE")
+    if override and override.strip():
+        # Return unconditionally (may not exist yet — get_tokens.py creates it).
+        return Path(override).expanduser()
     locations = [
         Path(__file__).parent.parent.parent / ".env",  # Project root
         Path.cwd() / ".env",  # Current directory
