@@ -171,6 +171,65 @@ class TestTokenRefresh:
         # And of course the response then updates us further
         assert client.refresh_token == "RT3-new-refresh"
 
+    @patch("whoop_mcp.client.set_key")
+    def test_refresh_completes_despite_caller_cancellation(self, mock_set_key, client):
+        """Regression: 2026-07-28T12:00Z — the exchange must survive an
+        aborted caller.
+
+        A cold-started whoop backend's lazy refresh exceeded alix's 5s
+        per-context-source timeout; the context assembler aborted the tool
+        call mid-exchange. WHOOP had already consumed the old refresh token,
+        but the successor was never persisted → lineage wedged with
+        "invalid_request" until manual re-auth. The exchange is now wrapped in
+        asyncio.shield, so cancelling the caller no longer interrupts the
+        POST + set_key — disk and WHOOP stay in lock-step.
+        """
+        post_started = asyncio.Event()
+        release_post = asyncio.Event()
+
+        async def slow_post(_url, data=None, **_kwargs):
+            post_started.set()
+            await release_post.wait()  # stand in for the in-flight OAuth round-trip
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "access_token": "post-cancel-access",
+                "refresh_token": "post-cancel-refresh",
+            }
+            return mock_response
+
+        mock_http_client = AsyncMock()
+        mock_http_client.post = slow_post
+        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def scenario():
+            with patch("whoop_mcp.client.httpx.AsyncClient", return_value=mock_http_client):
+                # The MCP tool handler awaits the refresh...
+                caller = asyncio.ensure_future(client._refresh_access_token())
+                await post_started.wait()
+                # ...but alix's 5s source timeout fires and aborts it mid-exchange.
+                caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await caller
+                # The shielded exchange is still running detached — let it finish.
+                release_post.set()
+                for _ in range(100):
+                    if client.refresh_token == "post-cancel-refresh":
+                        break
+                    await asyncio.sleep(0.01)
+
+        asyncio.run(scenario())
+
+        # Despite the caller's cancellation, the rotated token was persisted.
+        assert client.access_token == "post-cancel-access"
+        assert client.refresh_token == "post-cancel-refresh"
+        refresh_writes = [
+            c for c in mock_set_key.call_args_list
+            if c.args[1:] == ("WHOOP_REFRESH_TOKEN", "post-cancel-refresh")
+        ]
+        assert refresh_writes, "rotated refresh token must be persisted despite cancellation"
+
 
 # --- API requests ---
 
