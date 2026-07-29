@@ -99,8 +99,27 @@ class WhoopClient:
     async def _refresh_access_token(self) -> None:
         """Refresh the access token using the refresh token.
 
-        Uses a module-level lock to prevent concurrent refresh attempts
-        (which would invalidate each other's refresh tokens).
+        The token exchange + disk persist runs under asyncio.shield so a
+        cancellation of the *caller* cannot interrupt it mid-flight. WHOOP
+        rotates (and immediately invalidates) the refresh token the instant
+        the POST is received; if this coroutine were cancelled between that
+        POST and set_key() persisting the successor, the rotated token would
+        be lost and the lineage wedged with "invalid_request" until manual
+        re-auth.
+
+        That exact abort happened live 2026-07-28T12:00Z (UTC): a cold-started
+        whoop backend's lazy refresh exceeded alix's 5s per-context-source
+        timeout, the context assembler aborted the tool call mid-exchange, and
+        the rotated token was never written to disk — silently killing the
+        next morning's morning-checkin. The process survives the abort (only
+        the request coroutine is cancelled), so shielding lets the exchange
+        run to completion regardless, keeping disk and WHOOP in lock-step.
+        """
+        await asyncio.shield(self._refresh_access_token_locked())
+
+    async def _refresh_access_token_locked(self) -> None:
+        """Serialized token exchange. Never call directly — go through
+        _refresh_access_token so the critical section is cancellation-shielded.
         """
         global _last_token_refresh
 
