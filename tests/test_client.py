@@ -85,6 +85,90 @@ class TestTokenRefresh:
         client_mod._last_token_refresh = datetime.now() - timedelta(minutes=TOKEN_LIFETIME_MINUTES + 1)
         assert client._token_needs_refresh() is True
 
+    def test_fresh_process_skips_refresh_when_persisted_token_valid(self, client, monkeypatch):
+        """A freshly-spawned process must NOT rotate the single-use refresh token
+        when the on-disk access token is still valid. This is the fix for the
+        recurring lineage-orphaning wedge: every extra spawn used to rotate."""
+        import whoop_mcp.client as client_mod
+        client_mod._last_token_refresh = None
+        future = int((datetime.now() + timedelta(minutes=30)).timestamp())
+        monkeypatch.setattr(
+            "whoop_mcp.client.dotenv_values",
+            lambda _path: {"WHOOP_ACCESS_TOKEN_EXPIRES_AT": str(future)},
+        )
+        assert client._token_needs_refresh() is False
+
+    def test_fresh_process_refreshes_when_persisted_token_expired(self, client, monkeypatch):
+        import whoop_mcp.client as client_mod
+        client_mod._last_token_refresh = None
+        past = int((datetime.now() - timedelta(minutes=1)).timestamp())
+        monkeypatch.setattr(
+            "whoop_mcp.client.dotenv_values",
+            lambda _path: {"WHOOP_ACCESS_TOKEN_EXPIRES_AT": str(past)},
+        )
+        assert client._token_needs_refresh() is True
+
+    def test_fresh_process_refreshes_within_safety_margin(self, client, monkeypatch):
+        """Valid but inside EXPIRY_SAFETY_MARGIN → refresh proactively."""
+        import whoop_mcp.client as client_mod
+        client_mod._last_token_refresh = None
+        soon = int((datetime.now() + timedelta(minutes=2)).timestamp())
+        monkeypatch.setattr(
+            "whoop_mcp.client.dotenv_values",
+            lambda _path: {"WHOOP_ACCESS_TOKEN_EXPIRES_AT": str(soon)},
+        )
+        assert client._token_needs_refresh() is True
+
+    def test_fresh_process_falls_back_to_proactive_refresh_without_expiry(self, client, monkeypatch):
+        """Older token files lack the expiry field → preserve historical behavior."""
+        import whoop_mcp.client as client_mod
+        client_mod._last_token_refresh = None
+        monkeypatch.setattr("whoop_mcp.client.dotenv_values", lambda _path: {})
+        assert client._token_needs_refresh() is True
+
+    @patch("whoop_mcp.client.set_key")
+    def test_refresh_persists_access_token_expiry(self, mock_set_key, client):
+        """When WHOOP returns expires_in, the successor's expiry is persisted so
+        the next fresh process can skip a needless (lineage-risking) rotation."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }
+        mock_http_client = AsyncMock()
+        mock_http_client.post.return_value = mock_response
+        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=mock_http_client):
+            asyncio.run(client._refresh_access_token())
+
+        persisted = {c.args[1]: c.args[2] for c in mock_set_key.call_args_list}
+        assert "WHOOP_ACCESS_TOKEN_EXPIRES_AT" in persisted
+        assert int(persisted["WHOOP_ACCESS_TOKEN_EXPIRES_AT"]) > datetime.now().timestamp()
+
+    @patch("whoop_mcp.client.set_key")
+    def test_refresh_omits_expiry_when_absent(self, mock_set_key, client):
+        """No expires_in in the response → no expiry key written (older behavior)."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+        }
+        mock_http_client = AsyncMock()
+        mock_http_client.post.return_value = mock_response
+        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=mock_http_client):
+            asyncio.run(client._refresh_access_token())
+
+        persisted_keys = {c.args[1] for c in mock_set_key.call_args_list}
+        assert "WHOOP_ACCESS_TOKEN_EXPIRES_AT" not in persisted_keys
+
     @patch("whoop_mcp.client.set_key")
     def test_refresh_updates_tokens(self, mock_set_key, client):
         mock_response = MagicMock()

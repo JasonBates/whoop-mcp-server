@@ -49,6 +49,29 @@ load_dotenv(ENV_PATH)
 _last_token_refresh: Optional[datetime] = None
 _refresh_lock = asyncio.Lock()
 TOKEN_LIFETIME_MINUTES = 55  # Refresh proactively before the 60-min expiry
+# Refresh this far ahead of the persisted access-token expiry (clock skew / in-flight margin).
+EXPIRY_SAFETY_MARGIN = timedelta(minutes=5)
+
+
+def _read_persisted_access_token_expiry() -> Optional[datetime]:
+    """Read WHOOP_ACCESS_TOKEN_EXPIRES_AT (epoch seconds) from the token file.
+
+    Lets a freshly-spawned process decide whether the on-disk access token is
+    still usable WITHOUT proactively rotating the single-use refresh token.
+    Returns None when the field is absent or unparseable (older token files that
+    predate this field), in which case callers fall back to the historical
+    proactive-refresh behavior.
+    """
+    try:
+        raw = dotenv_values(ENV_PATH).get("WHOOP_ACCESS_TOKEN_EXPIRES_AT")
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        return datetime.fromtimestamp(int(raw))
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 class WhoopAuthError(Exception):
@@ -80,12 +103,35 @@ class WhoopClient:
             )
 
     def _token_needs_refresh(self) -> bool:
-        """Check if the token should be proactively refreshed."""
+        """Check if the token should be proactively refreshed.
+
+        A fresh process resets the in-memory ``_last_token_refresh`` to None.
+        Historically that forced a proactive refresh on the FIRST call of every
+        spawn. Because WHOOP rotates — and immediately invalidates — the refresh
+        token on every use, frequent backend respawns (idle blue-green restarts,
+        per-webhook context fetches) rotated the single-use lineage far more often
+        than the ~hourly access-token lifetime actually required. Each extra
+        rotation is another chance for the successor to be lost to a process
+        teardown between the WHOOP POST and the disk persist, wedging the whole
+        lineage until manual re-auth.
+
+        To avoid needless rotation, a fresh process now consults the persisted
+        access-token expiry: if the on-disk token is still valid we skip the
+        refresh entirely and let the request use it (the 401 fallback in
+        ``_request`` still covers a genuinely-expired token). Only when the expiry
+        is unknown do we fall back to the old proactive-refresh behavior.
+        """
         global _last_token_refresh
-        if _last_token_refresh is None:
-            return True  # Never refreshed this session
-        elapsed = datetime.now() - _last_token_refresh
-        return elapsed > timedelta(minutes=TOKEN_LIFETIME_MINUTES)
+        if _last_token_refresh is not None:
+            elapsed = datetime.now() - _last_token_refresh
+            return elapsed > timedelta(minutes=TOKEN_LIFETIME_MINUTES)
+
+        expires_at = _read_persisted_access_token_expiry()
+        if expires_at is not None:
+            return datetime.now() >= (expires_at - EXPIRY_SAFETY_MARGIN)
+        # Unknown expiry (token file predates this field) — preserve the historical
+        # proactive-refresh-on-first-call behavior.
+        return True
 
     async def ensure_fresh_token(self) -> None:
         """Ensure token is fresh before making concurrent requests.
@@ -174,14 +220,31 @@ class WhoopClient:
                 self.refresh_token = tokens.get("refresh_token", self.refresh_token)
                 _last_token_refresh = datetime.now()  # Record refresh time
 
+                # Persist the access-token expiry so a future fresh process can tell
+                # whether the on-disk token is still usable WITHOUT rotating the
+                # single-use refresh token. WHOOP returns expires_in (seconds).
+                expires_at_epoch: Optional[int] = None
+                expires_in = tokens.get("expires_in")
+                if expires_in:
+                    try:
+                        expires_at_epoch = int(
+                            (_last_token_refresh + timedelta(seconds=int(expires_in))).timestamp()
+                        )
+                    except (ValueError, TypeError):
+                        expires_at_epoch = None
+
                 # Save new tokens to .env (quote_mode="never" prevents quote issues)
                 set_key(str(ENV_PATH), "WHOOP_ACCESS_TOKEN", self.access_token, quote_mode="never")
                 if tokens.get("refresh_token"):
                     set_key(str(ENV_PATH), "WHOOP_REFRESH_TOKEN", self.refresh_token, quote_mode="never")
+                if expires_at_epoch is not None:
+                    set_key(str(ENV_PATH), "WHOOP_ACCESS_TOKEN_EXPIRES_AT", str(expires_at_epoch), quote_mode="never")
 
                 # Also update in-memory env vars so new WhoopClient instances get fresh tokens
                 os.environ["WHOOP_ACCESS_TOKEN"] = self.access_token
                 os.environ["WHOOP_REFRESH_TOKEN"] = self.refresh_token
+                if expires_at_epoch is not None:
+                    os.environ["WHOOP_ACCESS_TOKEN_EXPIRES_AT"] = str(expires_at_epoch)
 
     async def _request(
         self,

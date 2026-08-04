@@ -15,6 +15,7 @@ Usage:
 import os
 import sys
 import webbrowser
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, parse_qs, urlparse
 from pathlib import Path
@@ -123,8 +124,14 @@ def exchange_code_for_tokens(client_id: str, client_secret: str, code: str) -> d
     return response.json()
 
 
-def save_tokens_to_env(access_token: str, refresh_token: str):
-    """Save tokens to .env file."""
+def save_tokens_to_env(access_token: str, refresh_token: str, expires_in=None):
+    """Save tokens to .env file.
+
+    Also persists WHOOP_ACCESS_TOKEN_EXPIRES_AT (epoch seconds) when the token
+    response includes ``expires_in`` so a freshly-spawned client can tell the
+    access token is still valid and skip a needless refresh — which would
+    otherwise rotate (and risk orphaning) the single-use refresh token.
+    """
     # Create .env if it doesn't exist
     if not ENV_PATH.exists():
         ENV_PATH.touch()
@@ -132,6 +139,12 @@ def save_tokens_to_env(access_token: str, refresh_token: str):
     # quote_mode="never" prevents quotes that can break token parsing
     set_key(str(ENV_PATH), "WHOOP_ACCESS_TOKEN", access_token, quote_mode="never")
     set_key(str(ENV_PATH), "WHOOP_REFRESH_TOKEN", refresh_token, quote_mode="never")
+    if expires_in:
+        try:
+            expires_at = int((datetime.now() + timedelta(seconds=int(expires_in))).timestamp())
+            set_key(str(ENV_PATH), "WHOOP_ACCESS_TOKEN_EXPIRES_AT", str(expires_at), quote_mode="never")
+        except (ValueError, TypeError):
+            pass
     print(f"\n✓ Tokens saved to {ENV_PATH}")
 
 
@@ -225,7 +238,7 @@ def main():
             print("⚠ No refresh token received (did you include 'offline' scope?)")
 
         # Save tokens
-        save_tokens_to_env(access_token, refresh_token)
+        save_tokens_to_env(access_token, refresh_token, tokens.get("expires_in"))
 
         # Test the connection
         test_api_connection(access_token)
