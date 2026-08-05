@@ -51,6 +51,15 @@ _refresh_lock = asyncio.Lock()
 TOKEN_LIFETIME_MINUTES = 55  # Refresh proactively before the 60-min expiry
 # Refresh this far ahead of the persisted access-token expiry (clock skew / in-flight margin).
 EXPIRY_SAFETY_MARGIN = timedelta(minutes=5)
+# WHOOP's OAuth token endpoint can take several seconds on a cold refresh
+# (observed 5s+ on the 1pm halftime run against a token idle since morning).
+# httpx defaults to a 5s timeout, so the POST was aborting mid-rotation — WHOOP
+# had already invalidated the old refresh token, but we never received/persisted
+# the successor, desyncing the lineage until manual re-auth (ReadTimeout in the
+# logs, ~5126ms in the audit trail). Give the exchange real headroom, while
+# staying under Alix's 15s per-context-source timeout so the context assembler
+# doesn't abort the tool call either.
+HTTP_TIMEOUT_SECONDS = 12.0
 
 
 def _read_persisted_access_token_expiry() -> Optional[datetime]:
@@ -201,7 +210,7 @@ class WhoopClient:
             if not self.refresh_token:
                 raise WhoopAuthError("No refresh token available. Re-run get_tokens.py")
 
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     self.TOKEN_URL,
                     data={
@@ -261,7 +270,7 @@ class WhoopClient:
         url = f"{self.BASE_URL}{endpoint}"
         headers = {"Authorization": f"Bearer {self.access_token}"}
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
             response = await client.request(method, url, headers=headers, params=params)
 
             # Fallback: handle unexpected token expiration

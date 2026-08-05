@@ -195,6 +195,27 @@ class TestTokenRefresh:
             asyncio.run(client._refresh_access_token())
 
     @patch("whoop_mcp.client.set_key")
+    def test_refresh_uses_generous_http_timeout(self, mock_set_key, client):
+        """The refresh POST must not use httpx's 5s default: a slow WHOOP cold
+        refresh aborting mid-rotation is what desyncs the token lineage. It must
+        also stay under Alix's 15s per-context-source timeout."""
+        from whoop_mcp.client import HTTP_TIMEOUT_SECONDS
+        assert 10 <= HTTP_TIMEOUT_SECONDS < 15
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"access_token": "a", "refresh_token": "b", "expires_in": 3600}
+        mock_http_client = AsyncMock()
+        mock_http_client.post.return_value = mock_response
+        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=mock_http_client) as mock_ctor:
+            asyncio.run(client._refresh_access_token())
+
+        assert mock_ctor.call_args.kwargs.get("timeout") == HTTP_TIMEOUT_SECONDS
+
+    @patch("whoop_mcp.client.set_key")
     def test_refresh_raises_on_failure(self, mock_set_key, client):
         mock_response = MagicMock()
         mock_response.status_code = 400
