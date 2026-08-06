@@ -348,6 +348,77 @@ class TestTokenRefresh:
         ]
         assert refresh_writes, "rotated refresh token must be persisted despite cancellation"
 
+    @patch("whoop_mcp.client.set_key")
+    def test_refresh_outlives_a_caller_timeout(self, mock_set_key, client):
+        """Regression: 2026-08-05T12:00Z — a refresh SLOWER than the caller's
+        timeout must still persist the successor.
+
+        Distinct from the cancellation case above. There the caller was
+        cancelled explicitly; here it times out, which is how alix's 15s
+        per-context-source limit actually manifests. The old code capped the
+        refresh POST at 12s specifically to stay *under* that limit, on the
+        theory that the tool call and the exchange should fail together. That
+        coupling was the bug: WHOOP completed the exchange server-side and
+        invalidated the old refresh token, our own httpx timeout threw before
+        we could read the successor, and the lineage wedged with
+        "invalid_request" (not "invalid_grant") until manual re-auth.
+
+        asyncio.shield cannot save the POST from a timeout raised *inside* the
+        shielded coroutine — the only fix is to let the exchange outlive the
+        caller. This test locks that in: the caller gives up, the exchange
+        keeps running, the successor lands on disk for the next call.
+        """
+        async def slow_post(_url, data=None, **_kwargs):
+            await asyncio.sleep(0.2)  # exchange outlasts the caller's patience
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "access_token": "outlived-access",
+                "refresh_token": "outlived-refresh",
+            }
+            return mock_response
+
+        mock_http_client = AsyncMock()
+        mock_http_client.post = slow_post
+        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def scenario():
+            with patch("whoop_mcp.client.httpx.AsyncClient", return_value=mock_http_client):
+                refresh = asyncio.ensure_future(client._refresh_access_token())
+                # Stand in for alix's per-context-source timeout giving up on
+                # the tool call. shield() means this does NOT kill the exchange.
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(refresh), timeout=0.05)
+                # The tool call has already failed by now; the exchange has not.
+                await refresh
+
+        asyncio.run(scenario())
+
+        assert client.access_token == "outlived-access"
+        assert client.refresh_token == "outlived-refresh"
+        refresh_writes = [
+            c for c in mock_set_key.call_args_list
+            if c.args[1:] == ("WHOOP_REFRESH_TOKEN", "outlived-refresh")
+        ]
+        assert refresh_writes, "successor must be persisted even though the caller timed out"
+
+    def test_refresh_timeout_exceeds_alix_context_source_timeout(self):
+        """The refresh timeout must stay comfortably above alix's per-context-
+        source timeout (15s, sql/014). If someone ever re-couples them to make
+        the tool call and the exchange fail together, that reintroduces the
+        2026-08-05 orphan directly — this is the guard against that.
+        """
+        from whoop_mcp.client import (
+            HTTP_TIMEOUT_SECONDS,
+            TOKEN_REFRESH_TIMEOUT_SECONDS,
+        )
+        ALIX_CONTEXT_SOURCE_TIMEOUT = 15.0
+        assert TOKEN_REFRESH_TIMEOUT_SECONDS > ALIX_CONTEXT_SOURCE_TIMEOUT * 2
+        # Ordinary data requests should stay short — a hung endpoint must fail
+        # the tool call promptly rather than inherit the refresh's patience.
+        assert HTTP_TIMEOUT_SECONDS <= ALIX_CONTEXT_SOURCE_TIMEOUT
+
 
 # --- API requests ---
 
