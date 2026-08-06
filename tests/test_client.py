@@ -196,11 +196,24 @@ class TestTokenRefresh:
 
     @patch("whoop_mcp.client.set_key")
     def test_refresh_uses_generous_http_timeout(self, mock_set_key, client):
-        """The refresh POST must not use httpx's 5s default: a slow WHOOP cold
-        refresh aborting mid-rotation is what desyncs the token lineage. It must
-        also stay under Alix's 15s per-context-source timeout."""
-        from whoop_mcp.client import HTTP_TIMEOUT_SECONDS
-        assert 10 <= HTTP_TIMEOUT_SECONDS < 15
+        """The refresh POST gets its own, deliberately long timeout.
+
+        The exchange is single-use and non-idempotent: once WHOOP receives the
+        POST the old refresh token is dead, so ANY client-side abort orphans the
+        successor. An earlier version capped this at 12s to stay under Alix's 15s
+        per-context-source timeout — and that cap is precisely what killed the
+        token on 2026-08-05. The refresh must be free to outlive the caller's
+        timeout; asyncio.shield keeps it running to completion after the tool
+        call has already failed, so the next call finds a persisted token.
+        """
+        from whoop_mcp.client import (
+            HTTP_TIMEOUT_SECONDS,
+            TOKEN_REFRESH_TIMEOUT_SECONDS,
+        )
+        # Must comfortably exceed the 15s per-context-source timeout it is
+        # explicitly allowed to outlive, and the ordinary data-request timeout.
+        assert TOKEN_REFRESH_TIMEOUT_SECONDS >= 30
+        assert TOKEN_REFRESH_TIMEOUT_SECONDS > HTTP_TIMEOUT_SECONDS
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -213,7 +226,7 @@ class TestTokenRefresh:
         with patch("whoop_mcp.client.httpx.AsyncClient", return_value=mock_http_client) as mock_ctor:
             asyncio.run(client._refresh_access_token())
 
-        assert mock_ctor.call_args.kwargs.get("timeout") == HTTP_TIMEOUT_SECONDS
+        assert mock_ctor.call_args.kwargs.get("timeout") == TOKEN_REFRESH_TIMEOUT_SECONDS
 
     @patch("whoop_mcp.client.set_key")
     def test_refresh_raises_on_failure(self, mock_set_key, client):
