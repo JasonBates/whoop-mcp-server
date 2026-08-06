@@ -51,15 +51,34 @@ _refresh_lock = asyncio.Lock()
 TOKEN_LIFETIME_MINUTES = 55  # Refresh proactively before the 60-min expiry
 # Refresh this far ahead of the persisted access-token expiry (clock skew / in-flight margin).
 EXPIRY_SAFETY_MARGIN = timedelta(minutes=5)
-# WHOOP's OAuth token endpoint can take several seconds on a cold refresh
-# (observed 5s+ on the 1pm halftime run against a token idle since morning).
-# httpx defaults to a 5s timeout, so the POST was aborting mid-rotation — WHOOP
-# had already invalidated the old refresh token, but we never received/persisted
-# the successor, desyncing the lineage until manual re-auth (ReadTimeout in the
-# logs, ~5126ms in the audit trail). Give the exchange real headroom, while
-# staying under Alix's 15s per-context-source timeout so the context assembler
-# doesn't abort the tool call either.
+# Timeout for ordinary data requests to the WHOOP API. Bounded so a hung
+# endpoint fails the tool call promptly rather than stalling a context source.
 HTTP_TIMEOUT_SECONDS = 12.0
+
+# Timeout for the OAuth refresh POST specifically — deliberately far longer.
+#
+# A refresh is a SINGLE-USE, NON-IDEMPOTENT exchange: the instant WHOOP receives
+# the POST it invalidates the old refresh token and mints a successor. Any
+# client-side abort after that point loses the successor forever and wedges the
+# lineage with "invalid_request" (note: NOT "invalid_grant") until manual
+# re-auth. So there is no such thing as a safe client-side timeout here — the
+# only correct move is to wait for the answer.
+#
+# The earlier 12.0 value was chosen to stay under Alix's 15s per-context-source
+# timeout, on the theory that the tool call and the refresh had to succeed or
+# fail together. That was the bug: it made our own timeout the orphan mechanism.
+# Observed live 2026-08-05T12:00Z (UTC) on the 1pm halftime run — the POST hit
+# 12.0s and raised (an empty-message httpx timeout in the logs), the retry 12s
+# later got "invalid_request", and the next morning's morning-checkin ran with
+# no WHOOP data. Third token death by the same family of cause.
+#
+# Decoupling the two is safe because _refresh_access_token runs the exchange
+# under asyncio.shield: the caller's tool call can time out and fail fast while
+# the shielded exchange runs to completion and persists the successor to disk,
+# so the NEXT call picks up a valid token. A slow refresh success always beats
+# an orphaned token — one failed context source costs a single agent run, an
+# orphan costs every WHOOP-dependent run until a human re-auths.
+TOKEN_REFRESH_TIMEOUT_SECONDS = 60.0
 
 
 def _read_persisted_access_token_expiry() -> Optional[datetime]:
@@ -210,7 +229,7 @@ class WhoopClient:
             if not self.refresh_token:
                 raise WhoopAuthError("No refresh token available. Re-run get_tokens.py")
 
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(timeout=TOKEN_REFRESH_TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     self.TOKEN_URL,
                     data={
