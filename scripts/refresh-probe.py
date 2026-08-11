@@ -182,13 +182,59 @@ def guard_token_file(path: Path) -> Path:
     return resolved
 
 
+def install_graceful_term() -> None:
+    """Make SIGTERM exit the way Ctrl-C does, so the lock file is released.
+
+    Two things conspire otherwise. Default SIGTERM handling kills the process
+    outright, stranding the lock so the next probe refuses to start. And a
+    process launched with `nohup ... &` from a non-interactive shell inherits
+    SIG_IGN for SIGINT — so SIGTERM is often the only signal that will reach a
+    backgrounded probe at all. Both observed 2026-08-11.
+
+    Safe against the critical section: DeferredSignals replaces this handler
+    for the duration of the token exchange and restores it afterwards.
+    """
+    def _raise(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _raise)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class ProbeLock:
     """Prevent two probes from racing the same lineage."""
 
     def __init__(self, token_file: Path) -> None:
         self.path = token_file.with_suffix(token_file.suffix + ".probe.lock")
 
+    def _clear_if_stale(self) -> None:
+        """Reclaim a lock whose owner is gone.
+
+        A probe killed with SIGKILL (or SIGTERM before the handler above
+        existed) leaves the file behind. Refusing to start forever because of a
+        dead process's litter is worse than the race the lock guards against —
+        especially for an experiment that must survive unattended for hours.
+        """
+        try:
+            prior = self.path.read_text().strip()
+        except OSError:
+            return
+        if prior.isdigit() and _pid_alive(int(prior)):
+            return
+        print(f"[probe] clearing stale lock from dead pid {prior or '?'}")
+        self.path.unlink(missing_ok=True)
+
     def __enter__(self) -> "ProbeLock":
+        self._clear_if_stale()
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
@@ -278,6 +324,52 @@ def do_refresh(
         response_keys=sorted(payload.keys()),
     )
     return record
+
+
+def do_control_probe(access_token: str) -> dict[str, Any]:
+    """Time a plain API round-trip to the SAME host, immediately before the refresh.
+
+    This is the control for the central confound. If a refresh after 90 minutes
+    idle takes 14 seconds, that could be (a) WHOOP's token endpoint being slow
+    on a cold grant, or (b) ordinary client-side cold start — DNS, TCP, TLS
+    handshake — on a connection that has been idle just as long.
+
+    Both requests go to api.prod.whoop.com over a fresh httpx client, so they
+    pay identical DNS/TCP/TLS costs. Only the endpoint differs. A control that
+    stays flat (~300ms) while the refresh climbs to seconds isolates the
+    slowness to the token exchange itself.
+
+    A 401 is a perfectly good measurement here — we want the round-trip time,
+    not the payload, and after the access token expires 401 is expected.
+    """
+    started = time.monotonic()
+    try:
+        response = httpx.get(
+            API_CHECK_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"limit": 1},
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        return {"latency_ms": round((time.monotonic() - started) * 1000),
+                "status": response.status_code}
+    except Exception as err:  # noqa: BLE001
+        return {"latency_ms": round((time.monotonic() - started) * 1000),
+                "error": f"{type(err).__name__}: {err}"}
+
+
+def access_token_expired(values: dict[str, str]) -> Optional[bool]:
+    """Was the access token already past its expiry when we refreshed?
+
+    The compact encoding of "cold": every death so far refreshed after expiry,
+    every healthy probe cycle refreshed before it.
+    """
+    raw = values.get("WHOOP_ACCESS_TOKEN_EXPIRES_AT")
+    if not raw:
+        return None
+    try:
+        return time.time() >= int(raw)
+    except ValueError:
+        return None
 
 
 def do_api_check(access_token: str) -> dict[str, Any]:
@@ -374,9 +466,15 @@ def analyze(path: Path) -> None:
     gapped = [r for r in records if r.get("idle_gap_minutes_before") is not None]
     if gapped:
         print("\n  IDLE-GAP LADDER")
+        print(f"    {'idle':>6}  {'refresh':>9}  {'control':>9}  {'expired':>7}  result")
         for r in gapped:
             gap = r["idle_gap_minutes_before"]
-            print(f"    {gap:>4} min idle -> {'ok' if r.get('ok') else 'FAILED'}")
+            ctl = (r.get("control_probe") or {}).get("latency_ms")
+            exp = r.get("access_token_expired_before")
+            print(f"    {gap:>4}m   {str(r.get('latency_ms', '?'))+'ms':>9}  "
+                  f"{(str(ctl)+'ms') if ctl is not None else '-':>9}  "
+                  f"{'yes' if exp else ('no' if exp is False else '?'):>7}  "
+                  f"{'ok' if r.get('ok') else 'FAILED'}")
         survived = [r["idle_gap_minutes_before"] for r in gapped if r.get("ok")]
         died = [r["idle_gap_minutes_before"] for r in gapped if not r.get("ok")]
         floor = max(survived) if survived else None
@@ -428,6 +526,11 @@ def main() -> None:
                         help="Stop after N cycles (0 = run until failure or signal).")
     parser.add_argument("--scope-mode", choices=("none", "offline"), default="none",
                         help="'none' reproduces production; 'offline' tests the fix.")
+    parser.add_argument("--control-probe", action="store_true",
+                        help="Time a plain API round-trip to the same host immediately "
+                             "BEFORE each refresh. Separates WHOOP-side token-endpoint "
+                             "latency from ordinary client-side connection cold start — "
+                             "the main confound in the cold-refresh hypothesis.")
     parser.add_argument("--api-check", action="store_true",
                         help="Also call the recovery endpoint to prove the access token works.")
     parser.add_argument("--stop-on-failure", action="store_true", default=True,
@@ -459,6 +562,8 @@ def main() -> None:
         parser.error(f"--interval must be >= {MIN_INTERVAL_SECONDS}s to stay well "
                      "inside WHOOP's published rate limits")
 
+    install_graceful_term()
+
     token_file = guard_token_file(args.token_file)
     log_path = token_file.with_suffix(token_file.suffix + ".probe.jsonl")
 
@@ -487,10 +592,20 @@ def main() -> None:
                 print("[probe] no WHOOP_REFRESH_TOKEN in token file — re-auth needed.")
                 break
 
+            # Control FIRST, while the connection is as cold as the refresh
+            # about to follow it. Ordering matters: run it after the refresh and
+            # it would reuse a freshly-warmed path and prove nothing.
+            control = do_control_probe(values.get("WHOOP_ACCESS_TOKEN", "")) \
+                if args.control_probe else None
+            expired_before = access_token_expired(values)
+
             # The exchange and its persist are one indivisible unit.
             with DeferredSignals() as sigs:
                 record = do_refresh(values, args.scope_mode, token_file)
                 record["cycle"] = cycle
+                record["access_token_expired_before"] = expired_before
+                if control is not None:
+                    record["control_probe"] = control
                 # The independent variable of the ladder experiment: how long
                 # the token sat idle before this refresh. Recorded on the cycle
                 # it *precedes* so a failure names the gap that killed it.
