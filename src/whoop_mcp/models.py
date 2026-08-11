@@ -1,8 +1,61 @@
 """Pydantic models for WHOOP API responses."""
 
-from datetime import datetime
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pydantic import BaseModel, Field
+
+# WHOOP returns every timestamp in UTC and carries the wearer's local offset in
+# a SEPARATE `timezone_offset` field ("+01:00"). Rendering the timestamp without
+# applying that field prints UTC while claiming to be local time.
+#
+# Observed live 2026-08-10: a walk that WHOOP recorded at 11:00 BST was logged
+# to the daily note as 10:06, because every strftime in server.py formatted the
+# raw UTC datetime. The consuming agent's prompt even instructs it to trust the
+# rendered time as local and NOT convert — so nothing downstream could correct
+# it. Every workout, sleep and recovery time was an hour early for the whole of
+# British Summer Time.
+_OFFSET_RE = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
+
+
+def to_local(dt: Optional[datetime], timezone_offset: Optional[str]) -> Optional[datetime]:
+    """Render a WHOOP UTC timestamp in the wearer's local time.
+
+    ``timezone_offset`` is WHOOP's per-record offset string, e.g. "+01:00" (it
+    also tolerates the "+0100" spelling). Returns the datetime shifted into that
+    offset, so ``.strftime()`` prints local wall-clock time.
+
+    Degrades to the input unchanged when the offset is missing or unparseable —
+    a slightly-wrong time beats a crashed context source, and the caller has no
+    better fallback available.
+    """
+    if dt is None:
+        return None
+    if not timezone_offset:
+        return dt
+    match = _OFFSET_RE.match(timezone_offset.strip())
+    if not match:
+        return dt
+    sign, hours, minutes = match.groups()
+    delta = timedelta(hours=int(hours), minutes=int(minutes))
+    if sign == "-":
+        delta = -delta
+    # Naive timestamps are assumed UTC: that is what the WHOOP API returns, and
+    # attaching UTC first is what makes astimezone a shift rather than a no-op.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone(delta))
+
+
+def to_local_for(record: object, dt: Optional[datetime]) -> Optional[datetime]:
+    """``to_local`` using whichever offset ``record`` carries.
+
+    Not every WHOOP model has one: Recovery is scoped to a cycle and exposes no
+    ``timezone_offset``, so it renders in UTC (its timestamps are date labels,
+    where an hour rarely matters). Reading the field defensively keeps one code
+    path for all record types and survives WHOOP adding or dropping the field.
+    """
+    return to_local(dt, getattr(record, "timezone_offset", None))
 
 
 class RecoveryScore(BaseModel):
