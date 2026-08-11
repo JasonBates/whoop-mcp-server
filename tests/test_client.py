@@ -420,6 +420,144 @@ class TestTokenRefresh:
         assert HTTP_TIMEOUT_SECONDS <= ALIX_CONTEXT_SOURCE_TIMEOUT
 
 
+# --- Refresh diagnostic logging ---
+
+class TestRefreshDiagnosticLogging:
+    """The refresh must record whether the LINEAGE ADVANCED, not just whether
+    the HTTP call succeeded.
+
+    Five token deaths were investigated without this fact. A refresh that
+    returns no successor leaves the just-consumed token on disk and looks
+    identical to a healthy one — including to the file-mtime staleness
+    tripwire, because the access token and expiry are rewritten either way.
+    These tests exist so that diagnostic can never be silently dropped.
+    """
+
+    def _mock_http(self, json_data, status_code=200, text=""):
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.json.return_value = json_data
+        mock_response.text = text
+        mock_http_client = AsyncMock()
+        mock_http_client.post.return_value = mock_response
+        mock_http_client.__aenter__ = AsyncMock(return_value=mock_http_client)
+        mock_http_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_http_client
+
+    @patch("whoop_mcp.client.set_key")
+    def test_logs_lineage_advanced_on_rotation(self, _mock_set_key, client, capsys):
+        http = self._mock_http({
+            "access_token": "new-access",
+            "refresh_token": "brand-new-refresh",
+            "expires_in": 3600,
+            "scope": "offline read:recovery",
+        })
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=http):
+            asyncio.run(client._refresh_access_token())
+
+        err = capsys.readouterr().err
+        assert "lineage advanced" in err
+        # Fingerprints, never token values.
+        assert "brand-new-refresh" not in err
+        assert "test-refresh-token" not in err
+
+    @patch("whoop_mcp.client.set_key")
+    def test_warns_when_no_successor_returned(self, _mock_set_key, client, capsys):
+        """The failure mode under investigation: 200 OK, but no new refresh
+        token — so the next refresh replays a token WHOOP already consumed."""
+        http = self._mock_http({
+            "access_token": "new-access",
+            "expires_in": 3600,
+            "scope": "read:recovery",
+        })
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=http):
+            asyncio.run(client._refresh_access_token())
+
+        err = capsys.readouterr().err
+        assert "NO SUCCESSOR" in err
+        assert "absent from response" in err
+        assert "will die with invalid_request" in err
+
+    @patch("whoop_mcp.client.set_key")
+    def test_warns_when_same_refresh_token_returned(self, _mock_set_key, client, capsys):
+        """Echoing the same token back is equally fatal and must not read as
+        a rotation."""
+        http = self._mock_http({
+            "access_token": "new-access",
+            "refresh_token": "test-refresh-token",  # unchanged
+            "expires_in": 3600,
+        })
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=http):
+            asyncio.run(client._refresh_access_token())
+
+        err = capsys.readouterr().err
+        assert "NO SUCCESSOR" in err
+        assert "same value returned" in err
+
+    @patch("whoop_mcp.client.set_key")
+    def test_logs_fingerprint_of_rejected_token_on_failure(self, _mock_set_key, client, capsys):
+        """Post-mortems need to know WHICH token was refused: the one we last
+        persisted (server-side invalidation) or a stale cached one (local bug)."""
+        http = self._mock_http(
+            {}, status_code=400, text='{"error":"invalid_request"}'
+        )
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=http):
+            with pytest.raises(WhoopAuthError):
+                asyncio.run(client._refresh_access_token())
+
+        err = capsys.readouterr().err
+        assert "token refresh FAILED" in err
+        assert "status=400" in err
+        assert "sent_fp=" in err
+        assert "test-refresh-token" not in err
+
+    @patch("whoop_mcp.client.set_key")
+    def test_logs_sibling_rotation(self, _mock_set_key, client, capsys, monkeypatch):
+        """The cross-process collision signal. If two consumers ever share one
+        token file again, this line is the evidence — it must not go quiet."""
+        monkeypatch.setattr(
+            "whoop_mcp.client.dotenv_values",
+            lambda _path: {"WHOOP_REFRESH_TOKEN": "rotated-by-someone-else"},
+        )
+        http = self._mock_http({
+            "access_token": "new-access",
+            "refresh_token": "brand-new-refresh",
+            "expires_in": 3600,
+        })
+        with patch("whoop_mcp.client.httpx.AsyncClient", return_value=http):
+            asyncio.run(client._refresh_access_token())
+
+        err = capsys.readouterr().err
+        assert "sibling rotation detected" in err
+        assert "Another process is writing" in err
+        assert "rotated-by-someone-else" not in err
+
+    def test_logs_reason_when_rotating_without_known_expiry(self, client, capsys, monkeypatch):
+        """The riskiest branch: rotating a single-use token on a fresh spawn
+        with no evidence the current one expired. Must say so out loud."""
+        monkeypatch.setattr("whoop_mcp.client.dotenv_values", lambda _path: {})
+        assert client._token_needs_refresh() is True
+        assert "NO persisted expiry" in capsys.readouterr().err
+
+    def test_quiet_when_no_refresh_needed(self, client, capsys, monkeypatch):
+        """Only rotations are logged. A call that reuses a valid token must not
+        add noise, or the signal drowns."""
+        monkeypatch.setattr(
+            "whoop_mcp.client._read_persisted_access_token_expiry",
+            lambda: datetime.now() + timedelta(hours=1),
+        )
+        assert client._token_needs_refresh() is False
+        assert capsys.readouterr().err == ""
+
+    def test_fingerprint_is_stable_and_non_reversible(self):
+        from whoop_mcp.client import _token_fp
+        assert _token_fp("abc") == _token_fp("abc")
+        assert _token_fp("abc") != _token_fp("abd")
+        assert "abc" not in _token_fp("abc")
+        assert _token_fp(None) == "none"
+        assert _token_fp("") == "none"
+
+
 # --- API requests ---
 
 class TestRequest:
