@@ -200,6 +200,26 @@ def install_graceful_term() -> None:
     signal.signal(signal.SIGTERM, _raise)
 
 
+def seconds_until_minute(target_minute: int, now: Optional[float] = None) -> float:
+    """Seconds to wait until the next HH:MM:00 for the given minute-of-hour.
+
+    Used to land refreshes exactly on a chosen minute. The production evidence
+    that motivates it: across 14 days, every WHOOP call slower than 5s landed on
+    :00 or :30 -- the cron minutes -- while the same methods elsewhere in the
+    hour averaged ~700ms. If that is a load spike rather than a coincidence, a
+    grant refreshing at :00 should fail far more often than one at :07.
+    """
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    # Seconds past the current hour, including the fractional part.
+    past = lt.tm_min * 60 + lt.tm_sec + (now - int(now))
+    target = target_minute * 60
+    delta = target - past
+    if delta <= 0:
+        delta += 3600
+    return delta
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -517,6 +537,13 @@ def main() -> None:
                         help="Isolated token file. Never Alix's production file.")
     parser.add_argument("--interval", type=int, default=900,
                         help="Seconds between refreshes (default 900 = 15 min).")
+    parser.add_argument("--at-minute", type=int, metavar="M",
+                        help="Refresh hourly at exactly HH:MM:00 (0-59). Tests whether "
+                             "the minute-of-hour matters: every slow WHOOP call in 14 "
+                             "days of production logs landed on :00 or :30, the cron "
+                             "minutes, while identical calls elsewhere in the hour "
+                             "averaged ~700ms. Pair --at-minute 0 against --at-minute 7 "
+                             "on separate grants to isolate that from everything else.")
     parser.add_argument("--ladder", metavar="MINS",
                         help="Escalating gaps in minutes, e.g. '30,45,55,65,75'. Each "
                              "gap is used once, then the last value repeats. Finds the "
@@ -548,6 +575,11 @@ def main() -> None:
     if not args.token_file:
         parser.error("--token-file is required (or use --analyze)")
 
+    if args.at_minute is not None and not (0 <= args.at_minute <= 59):
+        parser.error("--at-minute must be between 0 and 59")
+    if args.at_minute is not None and args.ladder:
+        parser.error("--at-minute and --ladder are mutually exclusive")
+
     ladder: list[int] = []
     if args.ladder:
         try:
@@ -577,6 +609,9 @@ def main() -> None:
         print(f"[probe] purpose    : find the idle gap at which the lineage dies.")
         print(f"[probe]              every successful cycle raises the proven-safe floor;")
         print(f"[probe]              the first failure is the ceiling.")
+    elif args.at_minute is not None:
+        print(f"[probe] schedule   : hourly at :{args.at_minute:02d}:00 (24 refreshes/day)")
+        print(f"[probe] purpose    : does the minute-of-hour drive the 502s?")
     else:
         print(f"[probe] interval   : {args.interval}s"
               f"  (~{round(86400 / args.interval)} refreshes/day)")
@@ -638,7 +673,10 @@ def main() -> None:
             # Ladder: use each gap once, then hold at the last (largest) value.
             # A successful cycle proves that gap is survivable; the first
             # failure brackets the boundary between it and the prior gap.
-            if ladder:
+            if args.at_minute is not None:
+                gap_before = round(seconds_until_minute(args.at_minute))
+                print(f"[probe] sleeping {gap_before}s until :{args.at_minute:02d}:00", flush=True)
+            elif ladder:
                 gap_before = ladder[cycle - 1] if cycle - 1 < len(ladder) else ladder[-1]
                 print(f"[probe] next gap: {gap_before // 60} min "
                       f"(proven safe so far: {(ladder[cycle - 2] // 60) if cycle >= 2 else 0} min)",
