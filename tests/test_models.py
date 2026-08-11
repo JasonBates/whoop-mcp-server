@@ -257,3 +257,75 @@ class TestModelValidation:
         assert w.sport_name == "pickleball"
         assert w.score.strain == 14.2
         assert w.score.zone_durations.zone_minutes(3) == 10.0
+
+
+# --- Local-time rendering ---
+
+class TestToLocal:
+    """WHOOP returns UTC timestamps plus a separate `timezone_offset`. Failing to
+    apply that field printed UTC while the consuming agent's prompt asserted the
+    time was already local — every workout, sleep and recovery time was an hour
+    early for the whole of British Summer Time (observed 2026-08-10)."""
+
+    def test_applies_positive_offset(self):
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local
+        utc = datetime(2026, 8, 10, 10, 0, 17, tzinfo=timezone.utc)
+        assert to_local(utc, "+01:00").strftime("%H:%M") == "11:00"
+
+    def test_applies_negative_offset(self):
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local
+        utc = datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc)
+        assert to_local(utc, "-05:00").strftime("%H:%M") == "05:00"
+
+    def test_offset_can_roll_the_date(self):
+        """A date label near midnight must follow local time, not UTC."""
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local
+        utc = datetime(2026, 8, 10, 23, 30, tzinfo=timezone.utc)
+        assert to_local(utc, "+01:00").strftime("%m/%d") == "08/11"
+
+    def test_naive_timestamps_are_treated_as_utc(self):
+        from datetime import datetime
+        from whoop_mcp.models import to_local
+        naive = datetime(2026, 8, 10, 10, 0)
+        assert to_local(naive, "+01:00").strftime("%H:%M") == "11:00"
+
+    def test_tolerates_compact_offset_spelling(self):
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local
+        utc = datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc)
+        assert to_local(utc, "+0100").strftime("%H:%M") == "11:00"
+
+    def test_degrades_to_input_on_missing_or_bad_offset(self):
+        """A slightly-wrong time beats a crashed context source."""
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local
+        utc = datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc)
+        for bad in (None, "", "not-an-offset", "Z"):
+            assert to_local(utc, bad) == utc
+        assert to_local(None, "+01:00") is None
+
+    def test_regression_2026_08_10_walk_logged_an_hour_early(self):
+        """The live case: an 11:00 BST walk was logged to the daily note as 10:0x."""
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local
+        start = datetime(2026, 8, 10, 10, 0, 17, tzinfo=timezone.utc)
+        assert to_local(start, "+01:00").strftime("%m/%d %H:%M") == "08/10 11:00"
+
+    def test_to_local_for_tolerates_records_without_an_offset(self):
+        """WHOOP's Recovery is scoped to a cycle and exposes no timezone_offset;
+        it must render rather than raise AttributeError."""
+        from datetime import datetime, timezone
+        from whoop_mcp.models import to_local_for
+
+        class NoOffset:
+            pass
+
+        class WithOffset:
+            timezone_offset = "+01:00"
+
+        utc = datetime(2026, 8, 10, 10, 0, tzinfo=timezone.utc)
+        assert to_local_for(NoOffset(), utc) == utc
+        assert to_local_for(WithOffset(), utc).strftime("%H:%M") == "11:00"

@@ -23,6 +23,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from whoop_mcp.client import WhoopClient, WhoopAuthError, WhoopAPIError, _log
+from whoop_mcp.models import to_local_for
 
 # Initialize the FastMCP server with a display name shown in Claude Desktop
 mcp = FastMCP("WHOOP Recovery")
@@ -87,7 +88,7 @@ async def get_today_summary() -> str:
         # Recovery section
         # score_state can be: SCORED (data ready), PENDING_SCORE (processing),
         # or UNSCORABLE (not enough data, e.g., WHOOP wasn't worn)
-        recovery_date = _format_date(recovery.created_at) if recovery else None
+        recovery_date = _format_date(to_local_for(recovery, recovery.created_at)) if recovery else None
         lines.append(f"RECOVERY (scored: {recovery_date})" if recovery_date else "RECOVERY")
         if recovery and recovery.score_state == "SCORED" and recovery.score:
             score = recovery.score
@@ -104,7 +105,10 @@ async def get_today_summary() -> str:
         lines.append("")
 
         # Sleep section
-        sleep_range = _format_sleep_range(sleep.start, sleep.end) if sleep else None
+        sleep_range = _format_sleep_range(
+            to_local_for(sleep, sleep.start),
+            to_local_for(sleep, sleep.end),
+        ) if sleep else None
         lines.append(f"SLEEP ({sleep_range})" if sleep_range else "SLEEP")
         if sleep and sleep.score_state == "SCORED" and sleep.score:
             score = sleep.score
@@ -125,7 +129,7 @@ async def get_today_summary() -> str:
 
         # Strain section
         cycle = cycles[0] if cycles else None
-        cycle_date = _format_date(cycle.start) if cycle else None
+        cycle_date = _format_date(to_local_for(cycle, cycle.start)) if cycle else None
         lines.append(f"STRAIN (cycle started: {cycle_date})" if cycle_date else "STRAIN")
         if cycle and cycle.score_state == "SCORED" and cycle.score:
             score = cycle.score
@@ -175,14 +179,14 @@ async def get_sleep_trend(days: int = 7) -> str:
                 stages = record.score.stage_summary
                 hours = stages.total_sleep_hours
                 perf = record.score.sleep_performance_percentage or 0
-                date = record.end.strftime("%m/%d")
+                date = to_local_for(record, record.end).strftime("%m/%d")
 
                 # Visual bar based on hours (8h = full bar)
                 filled = min(int(hours * 10 / 8), 10)
                 bar = "█" * filled + "░" * (10 - filled)
                 lines.append(f"{date}: {bar} {hours:.1f}h ({perf:.0f}% perf)")
             else:
-                date = record.end.strftime("%m/%d")
+                date = to_local_for(record, record.end).strftime("%m/%d")
                 lines.append(f"{date}: [not scored]")
 
         # Calculate averages
@@ -224,14 +228,14 @@ async def get_recovery_trend(days: int = 7) -> str:
             if record.score_state == "SCORED" and record.score:
                 score = record.score.recovery_score
                 hrv = record.score.hrv_rmssd_milli
-                date = record.created_at.strftime("%m/%d")
+                date = to_local_for(record, record.created_at).strftime("%m/%d")
 
                 # Simple visualization
                 filled = int(score) // 10
                 bar = "█" * filled + "░" * (10 - filled)
                 lines.append(f"{date}: {bar} {score:.0f}% (HRV: {hrv:.0f}ms)")
             else:
-                date = record.created_at.strftime("%m/%d")
+                date = to_local_for(record, record.created_at).strftime("%m/%d")
                 lines.append(f"{date}: [not scored]")
 
         # Calculate averages
@@ -270,9 +274,10 @@ async def get_workouts(limit: int = 5) -> str:
         lines = [f"Recent Workouts ({len(workouts)}):", ""]
 
         for w in workouts:
-            # Calculate duration
+            # Calculate duration (offset-invariant: both ends shift together)
             duration_mins = (w.end - w.start).total_seconds() / 60
-            date = w.start.strftime("%m/%d %H:%M")
+            # Render in the wearer's local time, not raw UTC. See models.to_local.
+            date = to_local_for(w, w.start).strftime("%m/%d %H:%M")
             sport = w.sport_name.replace("_", " ").title()
 
             if w.score_state == "SCORED" and w.score:
