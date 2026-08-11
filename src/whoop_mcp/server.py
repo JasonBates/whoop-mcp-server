@@ -22,7 +22,7 @@ from datetime import datetime
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from whoop_mcp.client import WhoopClient, WhoopAuthError, WhoopAPIError
+from whoop_mcp.client import WhoopClient, WhoopAuthError, WhoopAPIError, _log
 
 # Initialize the FastMCP server with a display name shown in Claude Desktop
 mcp = FastMCP("WHOOP Recovery")
@@ -61,6 +61,10 @@ async def get_today_summary() -> str:
     - Last night's sleep duration and quality
     - Current strain level and calories burned
     """
+    # Tool-call lines exist so a refresh in the log can be attributed to the
+    # caller that triggered it. Interleaved with the [whoop pid=...] refresh
+    # lines, they answer "what called the token and when" directly.
+    _log("tool call: get_today_summary()")
     try:
         client = WhoopClient()
 
@@ -150,6 +154,7 @@ async def get_sleep_trend(days: int = 7) -> str:
     Shows sleep duration, efficiency, and performance trends.
     """
 
+    _log(f"tool call: get_sleep_trend(days={days})")
     try:
         client = WhoopClient()
         records = await client.get_sleep(limit=days)
@@ -205,6 +210,7 @@ async def get_recovery_trend(days: int = 7) -> str:
     Shows the trend of your recovery to help identify patterns.
     """
 
+    _log(f"tool call: get_recovery_trend(days={days})")
     try:
         client = WhoopClient()
         records = await client.get_recovery_trend(days)
@@ -253,6 +259,7 @@ async def get_workouts(limit: int = 5) -> str:
     duration, calories, and heart rate zones.
     """
 
+    _log(f"tool call: get_workouts(limit={limit})")
     try:
         client = WhoopClient()
         workouts = await client.get_workouts(limit=limit)

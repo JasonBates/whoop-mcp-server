@@ -1,6 +1,7 @@
 """WHOOP API client with automatic token refresh."""
 
 import asyncio
+import hashlib
 import os
 import sys
 from datetime import datetime, timedelta
@@ -81,6 +82,45 @@ HTTP_TIMEOUT_SECONDS = 12.0
 TOKEN_REFRESH_TIMEOUT_SECONDS = 60.0
 
 
+def _token_fp(value: Optional[str]) -> str:
+    """Short, stable fingerprint of a token — safe to log.
+
+    Never log token values. A fingerprint is all that is needed to answer the
+    only question that matters after the fact: did this value change?
+    """
+    if not value:
+        return "none"
+    return hashlib.sha256(value.encode()).hexdigest()[:12]
+
+
+def _log(message: str) -> None:
+    """Log to stderr — stdout is the MCP protocol channel and must stay clean.
+
+    Alix captures this as ``[whoop:stderr]`` in its process log, so these lines
+    land in the same place as the refresh failures they explain.
+
+    The pid is in every line on purpose. The failure mode these logs exist to
+    catch is two processes sharing one single-use token lineage, and that is
+    unreadable unless each line says who emitted it.
+    """
+    print(f"[whoop pid={os.getpid()}] {message}", file=sys.stderr, flush=True)
+
+
+# Announce, at import, which process is bound to which lineage.
+#
+# "Who else is holding this token file?" is the first question in every WHOOP
+# token post-mortem, and until now it could only be inferred after the fact.
+# One line per spawn makes it greppable: the resolved token file, whether
+# WHOOP_TOKEN_FILE steered us there, and the fingerprint this process starts
+# from. Two processes announcing the SAME file is a collision — visible
+# immediately instead of days later via a dead lineage.
+_log(
+    f"start token_file={ENV_PATH} "
+    f"override={'WHOOP_TOKEN_FILE' if os.getenv('WHOOP_TOKEN_FILE') else 'none'} "
+    f"refresh_fp={_token_fp(os.getenv('WHOOP_REFRESH_TOKEN'))}"
+)
+
+
 def _read_persisted_access_token_expiry() -> Optional[datetime]:
     """Read WHOOP_ACCESS_TOKEN_EXPIRES_AT (epoch seconds) from the token file.
 
@@ -149,16 +189,38 @@ class WhoopClient:
         ``_request`` still covers a genuinely-expired token). Only when the expiry
         is unknown do we fall back to the old proactive-refresh behavior.
         """
+        # Each branch logs only when it decides to ROTATE. A rotation is the
+        # risky operation (single-use token), so the reason for every one of
+        # them needs to be on the record — particularly the third branch, which
+        # rotates without any evidence that the current token has expired.
         global _last_token_refresh
         if _last_token_refresh is not None:
             elapsed = datetime.now() - _last_token_refresh
-            return elapsed > timedelta(minutes=TOKEN_LIFETIME_MINUTES)
+            due = elapsed > timedelta(minutes=TOKEN_LIFETIME_MINUTES)
+            if due:
+                _log(
+                    f"refresh due: token refreshed in-process "
+                    f"{elapsed.total_seconds() / 60:.0f}m ago (limit {TOKEN_LIFETIME_MINUTES}m)"
+                )
+            return due
 
         expires_at = _read_persisted_access_token_expiry()
         if expires_at is not None:
-            return datetime.now() >= (expires_at - EXPIRY_SAFETY_MARGIN)
+            due = datetime.now() >= (expires_at - EXPIRY_SAFETY_MARGIN)
+            if due:
+                _log(
+                    f"refresh due: fresh process, on-disk access token expired/expiring at "
+                    f"{expires_at.isoformat(timespec='seconds')} "
+                    f"(safety margin {EXPIRY_SAFETY_MARGIN})"
+                )
+            return due
         # Unknown expiry (token file predates this field) — preserve the historical
         # proactive-refresh-on-first-call behavior.
+        _log(
+            "refresh due: fresh process and NO persisted expiry on disk — falling back "
+            "to proactive refresh. This rotates the single-use token without knowing "
+            "the current one had expired; frequent respawns here burn the lineage."
+        )
         return True
 
     async def ensure_fresh_token(self) -> None:
@@ -223,11 +285,30 @@ class WhoopClient:
             disk_vars = dotenv_values(ENV_PATH)
             disk_refresh = disk_vars.get("WHOOP_REFRESH_TOKEN")
             if disk_refresh and disk_refresh != self.refresh_token:
+                # THE cross-process collision signal. This branch firing means
+                # some other process rotated the lineage while we held a stale
+                # copy — i.e. two consumers are sharing one single-use token.
+                # It was previously silent, so every past investigation could
+                # only infer sharing after the lineage was already dead.
+                _log(
+                    f"sibling rotation detected: on-disk refresh token "
+                    f"{_token_fp(disk_refresh)} != in-memory {_token_fp(self.refresh_token)} "
+                    f"— adopting the disk copy. Another process is writing {ENV_PATH}."
+                )
                 self.refresh_token = disk_refresh
                 self.access_token = disk_vars.get("WHOOP_ACCESS_TOKEN") or self.access_token
 
             if not self.refresh_token:
                 raise WhoopAuthError("No refresh token available. Re-run get_tokens.py")
+
+            # Captured before the exchange so we can tell afterwards whether the
+            # lineage actually ADVANCED. Five separate token deaths (2026-05-22,
+            # 07-28, 08-05, 08-07, 08-10) were investigated without this fact,
+            # because the logs only ever recorded refresh FAILURES — never what
+            # the last SUCCESSFUL refresh returned. That made two very different
+            # causes indistinguishable: a good successor invalidated by something
+            # else, versus no successor ever being issued.
+            sent_refresh = self.refresh_token
 
             async with httpx.AsyncClient(timeout=TOKEN_REFRESH_TIMEOUT_SECONDS) as client:
                 response = await client.post(
@@ -241,9 +322,18 @@ class WhoopClient:
                 )
 
                 if response.status_code != 200:
+                    # Fingerprint the REJECTED token so a later post-mortem can
+                    # tell whether WHOOP refused the token we last persisted (a
+                    # server-side invalidation) or a stale one we were still
+                    # holding (a local caching / collision bug).
+                    _log(
+                        f"token refresh FAILED status={response.status_code} "
+                        f"sent_fp={_token_fp(sent_refresh)} — {response.text[:200]}"
+                    )
                     raise WhoopAuthError(f"Token refresh failed: {response.text}")
 
                 tokens = response.json()
+                returned_refresh = tokens.get("refresh_token")
                 self.access_token = tokens["access_token"]
                 self.refresh_token = tokens.get("refresh_token", self.refresh_token)
                 _last_token_refresh = datetime.now()  # Record refresh time
@@ -267,6 +357,29 @@ class WhoopClient:
                     set_key(str(ENV_PATH), "WHOOP_REFRESH_TOKEN", self.refresh_token, quote_mode="never")
                 if expires_at_epoch is not None:
                     set_key(str(ENV_PATH), "WHOOP_ACCESS_TOKEN_EXPIRES_AT", str(expires_at_epoch), quote_mode="never")
+
+                # THE diagnostic line. A refresh that succeeds but returns no
+                # successor leaves the just-consumed token on disk, so the NEXT
+                # refresh replays it and WHOOP answers 400 invalid_request —
+                # the recurring "lineage died overnight" failure. Until now that
+                # state was indistinguishable from a healthy refresh: the file
+                # mtime still moves (the access token and expiry are written
+                # either way), so even the staleness tripwire is fooled. The
+                # damage only surfaces hours later as an empty daily note.
+                if returned_refresh and returned_refresh != sent_refresh:
+                    _log(
+                        f"token refresh ok: lineage advanced "
+                        f"{_token_fp(sent_refresh)} -> {_token_fp(returned_refresh)} "
+                        f"scope={tokens.get('scope')!r} expires_in={expires_in}"
+                    )
+                else:
+                    reason = "same value returned" if returned_refresh else "absent from response"
+                    _log(
+                        f"token refresh ok BUT NO SUCCESSOR ({reason}) — refresh token "
+                        f"unchanged, fp={_token_fp(sent_refresh)}, scope={tokens.get('scope')!r}. "
+                        "The next refresh will replay a consumed token and the lineage "
+                        "will die with invalid_request."
+                    )
 
                 # Also update in-memory env vars so new WhoopClient instances get fresh tokens
                 os.environ["WHOOP_ACCESS_TOKEN"] = self.access_token
