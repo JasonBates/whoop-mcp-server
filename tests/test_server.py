@@ -434,8 +434,36 @@ class TestMain:
     @patch("whoop_mcp.server.mcp")
     def test_main_calls_run(self, mock_mcp):
         main()
-        mock_mcp.run.assert_called_once_with(transport="stdio")
+        # show_banner=False: FastMCP's 20-line ASCII banner went to stderr on
+        # every start, which Alix logs as [whoop:stderr] — 1151 times, drowning
+        # the token diagnostics that share that channel.
+        mock_mcp.run.assert_called_once_with(transport="stdio", show_banner=False)
 
     def test_dunder_main_imports(self):
         """Importing __main__ module should work without error."""
         import whoop_mcp.__main__  # noqa: F401
+
+
+class TestCleanShutdown:
+    """A normal stop must not look like a crash.
+
+    Alix stops a stdio backend by closing stdin / SIGTERM; anyio raises
+    KeyboardInterrupt and Python printed a ~15-line traceback to stderr.
+    Alix captures stderr as "[whoop:stderr]", so 632 ordinary restarts between
+    2026-07-28 and 08-11 were logged looking exactly like failures — in the
+    same channel as the token-lineage diagnostics.
+    """
+
+    def test_keyboardinterrupt_exits_quietly(self, capsys):
+        with patch("whoop_mcp.server.mcp.run", side_effect=KeyboardInterrupt):
+            main()  # must not raise
+        err = capsys.readouterr().err
+        assert "clean exit" in err
+        assert "Traceback" not in err
+        assert "KeyboardInterrupt" not in err
+
+    def test_real_errors_still_propagate(self):
+        """Only the shutdown path is swallowed — a genuine failure must surface."""
+        with patch("whoop_mcp.server.mcp.run", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                main()

@@ -317,8 +317,29 @@ async def get_workouts(limit: int = 5) -> str:
 
 # Entry point for running the server
 def main():
-    """Run the MCP server."""
-    mcp.run(transport="stdio")
+    """Run the MCP server.
+
+    A normal shutdown is not an error. Alix stops a stdio backend by closing
+    stdin and escalating to SIGTERM; anyio surfaces that to us as
+    KeyboardInterrupt, and Python's default handling printed a ~15-line
+    traceback to stderr on the way out. Alix captures anything on stderr as
+    "[whoop:stderr]", so every ordinary restart logged what looked exactly like
+    a crash — 632 of them between 2026-07-28 and 08-11.
+
+    That matters because stderr is also where the token-lineage diagnostics go.
+    Swallowing the traceback and emitting one line instead keeps that channel
+    meaning "something actually went wrong".
+
+    Same reason for show_banner=False: FastMCP prints a 20-line ASCII-art
+    banner to stderr on every start, which reached Alix's log 1151 times —
+    more noise than the tracebacks. Neither carries information a log reader
+    needs; the "[whoop pid=...] start ..." line already records the useful
+    facts (pid, token file, lineage fingerprint).
+    """
+    try:
+        mcp.run(transport="stdio", show_banner=False)
+    except KeyboardInterrupt:
+        _log("shutdown (stdin closed or interrupted) — clean exit")
 
 
 if __name__ == "__main__":
