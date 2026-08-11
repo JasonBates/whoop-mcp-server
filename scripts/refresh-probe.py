@@ -368,6 +368,30 @@ def analyze(path: Path) -> None:
             print(f"    last ok       {last_ok['ts']} "
                   f"(rotated={last_ok.get('refresh_rotated')})")
 
+    # Ladder result: the whole point of escalating gaps is to bracket the idle
+    # interval at which the lineage dies, so report it explicitly rather than
+    # making the reader reconstruct it from timestamps.
+    gapped = [r for r in records if r.get("idle_gap_minutes_before") is not None]
+    if gapped:
+        print("\n  IDLE-GAP LADDER")
+        for r in gapped:
+            gap = r["idle_gap_minutes_before"]
+            print(f"    {gap:>4} min idle -> {'ok' if r.get('ok') else 'FAILED'}")
+        survived = [r["idle_gap_minutes_before"] for r in gapped if r.get("ok")]
+        died = [r["idle_gap_minutes_before"] for r in gapped if not r.get("ok")]
+        floor = max(survived) if survived else None
+        ceiling = min(died) if died else None
+        print()
+        if floor is not None:
+            print(f"    longest SURVIVED idle gap : {floor} min")
+        if ceiling is not None:
+            print(f"    shortest FATAL idle gap   : {ceiling} min")
+            print(f"    -> boundary lies in ({floor if floor is not None else 0}, {ceiling}] minutes")
+            safe = int((floor or 0) * 0.6) or 5
+            print(f"    -> a keepalive refresh every ~{safe} min stays clear of it")
+        else:
+            print("    no fatal gap reached yet — the ladder has not found the ceiling")
+
     print("\n  VERDICT")
     if no_successor and not rotated:
         print("    WHOOP never returned a successor refresh token. The token on")
@@ -395,6 +419,10 @@ def main() -> None:
                         help="Isolated token file. Never Alix's production file.")
     parser.add_argument("--interval", type=int, default=900,
                         help="Seconds between refreshes (default 900 = 15 min).")
+    parser.add_argument("--ladder", metavar="MINS",
+                        help="Escalating gaps in minutes, e.g. '30,45,55,65,75'. Each "
+                             "gap is used once, then the last value repeats. Finds the "
+                             "idle interval at which the lineage dies. Overrides --interval.")
     parser.add_argument("--once", action="store_true", help="Single cycle, then exit.")
     parser.add_argument("--max-cycles", type=int, default=0,
                         help="Stop after N cycles (0 = run until failure or signal).")
@@ -416,7 +444,18 @@ def main() -> None:
 
     if not args.token_file:
         parser.error("--token-file is required (or use --analyze)")
-    if not args.once and args.interval < MIN_INTERVAL_SECONDS:
+
+    ladder: list[int] = []
+    if args.ladder:
+        try:
+            ladder = [int(x.strip()) * 60 for x in args.ladder.split(",") if x.strip()]
+        except ValueError:
+            parser.error("--ladder must be comma-separated whole minutes, e.g. '30,45,65'")
+        if not ladder:
+            parser.error("--ladder was empty")
+        if min(ladder) < MIN_INTERVAL_SECONDS:
+            parser.error(f"--ladder entries must be >= {MIN_INTERVAL_SECONDS // 60} minute(s)")
+    elif not args.once and args.interval < MIN_INTERVAL_SECONDS:
         parser.error(f"--interval must be >= {MIN_INTERVAL_SECONDS}s to stay well "
                      "inside WHOOP's published rate limits")
 
@@ -427,12 +466,20 @@ def main() -> None:
     print(f"[probe] log        : {log_path}")
     print(f"[probe] scope_mode : {args.scope_mode}"
           f"{'  (production behaviour)' if args.scope_mode == 'none' else '  (candidate fix)'}")
-    print(f"[probe] interval   : {args.interval}s"
-          f"  (~{round(86400 / args.interval)} refreshes/day)")
+    if ladder:
+        mins = ",".join(str(s // 60) for s in ladder)
+        print(f"[probe] ladder     : {mins} min (then {ladder[-1] // 60} repeating)")
+        print(f"[probe] purpose    : find the idle gap at which the lineage dies.")
+        print(f"[probe]              every successful cycle raises the proven-safe floor;")
+        print(f"[probe]              the first failure is the ceiling.")
+    else:
+        print(f"[probe] interval   : {args.interval}s"
+              f"  (~{round(86400 / args.interval)} refreshes/day)")
     print()
 
     with ProbeLock(token_file):
         cycle = 0
+        gap_before: Optional[int] = None
         while True:
             cycle += 1
             values = dict(dotenv_values(token_file))
@@ -444,6 +491,12 @@ def main() -> None:
             with DeferredSignals() as sigs:
                 record = do_refresh(values, args.scope_mode, token_file)
                 record["cycle"] = cycle
+                # The independent variable of the ladder experiment: how long
+                # the token sat idle before this refresh. Recorded on the cycle
+                # it *precedes* so a failure names the gap that killed it.
+                record["idle_gap_minutes_before"] = (
+                    None if gap_before is None else round(gap_before / 60)
+                )
                 if record.get("ok") and args.api_check:
                     fresh = dict(dotenv_values(token_file))
                     record["api_check"] = do_api_check(fresh.get("WHOOP_ACCESS_TOKEN", ""))
@@ -467,8 +520,19 @@ def main() -> None:
                 print(f"[probe] reached --max-cycles {args.max_cycles}.")
                 break
 
+            # Ladder: use each gap once, then hold at the last (largest) value.
+            # A successful cycle proves that gap is survivable; the first
+            # failure brackets the boundary between it and the prior gap.
+            if ladder:
+                gap_before = ladder[cycle - 1] if cycle - 1 < len(ladder) else ladder[-1]
+                print(f"[probe] next gap: {gap_before // 60} min "
+                      f"(proven safe so far: {(ladder[cycle - 2] // 60) if cycle >= 2 else 0} min)",
+                      flush=True)
+            else:
+                gap_before = args.interval
+
             try:
-                time.sleep(args.interval)
+                time.sleep(gap_before)
             except KeyboardInterrupt:
                 print("\n[probe] interrupted while idle — safe to stop.")
                 break
