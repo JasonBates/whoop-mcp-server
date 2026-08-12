@@ -74,10 +74,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -200,24 +203,91 @@ def install_graceful_term() -> None:
     signal.signal(signal.SIGTERM, _raise)
 
 
-def seconds_until_minute(target_minute: int, now: Optional[float] = None) -> float:
-    """Seconds to wait until the next HH:MM:00 for the given minute-of-hour.
+# Land this far AFTER the target second, never before it. Waking even a
+# fraction early is not a rounding nicety here: a probe that fires at :59:59.8
+# measures the second BEFORE the load arrives, so it understates the very spike
+# it exists to measure, and its timestamp bins it into the previous minute.
+# Observed 2026-08-12: `round()` on the remaining wait produced a repeating
+# :45:00 / :45:59 / :47:00 / :47:59 pattern, leaving 9 minutes apparently
+# unsampled and filing :30 and :15 readings under :29 and :14, which showed up
+# as two spurious spikes.
+OVERSHOOT_SECONDS = 0.10
 
-    Used to land refreshes exactly on a chosen minute. The production evidence
-    that motivates it: across 14 days, every WHOOP call slower than 5s landed on
-    :00 or :30 -- the cron minutes -- while the same methods elsewhere in the
-    hour averaged ~700ms. If that is a load spike rather than a coincidence, a
-    grant refreshing at :00 should fail far more often than one at :07.
+
+def sleep_until(target_epoch: float) -> None:
+    """Sleep to an absolute instant, accurately.
+
+    time.sleep(n) only guarantees *at least* n, and a single long sleep drifts
+    by however much the OS overshoots. Converging on the target — long sleep
+    first, then progressively shorter ones — lands within a few milliseconds
+    without spinning the CPU. Accuracy matters here because the effect being
+    measured has a hard edge at the minute boundary: a sample fired a second
+    early measures the quiet second before the load and understates the spike.
+    """
+    while True:
+        remaining = target_epoch - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(remaining if remaining < 0.02 else remaining * 0.85)
+
+
+def next_target_epoch(minutes: list[int], now: Optional[float] = None) -> float:
+    """Absolute epoch of the next firing instant across a set of minutes."""
+    now = time.time() if now is None else now
+    return now + min(seconds_until_minute(m, now) for m in minutes)
+
+
+def seconds_until_minute(target_minute: int, now: Optional[float] = None) -> float:
+    """Seconds to wait until just after the next HH:MM:00 for a minute-of-hour.
+
+    Deliberately overshoots by OVERSHOOT_SECONDS so the sample always lands
+    inside the intended minute rather than at the tail of the previous one.
     """
     now = time.time() if now is None else now
     lt = time.localtime(now)
     # Seconds past the current hour, including the fractional part.
     past = lt.tm_min * 60 + lt.tm_sec + (now - int(now))
-    target = target_minute * 60
+    target = target_minute * 60 + OVERSHOOT_SECONDS
     delta = target - past
     if delta <= 0:
         delta += 3600
     return delta
+
+
+def sweep_minutes_for_hour(stride: int, hour: int) -> list[int]:
+    """Which minutes this hour's slice of a rotating sweep covers.
+
+    Hour H samples the minutes where ``m % stride == H % stride``, so each hour
+    takes a different slice and every minute is covered once every ``stride``
+    hours. With stride 5 that is 12 samples an hour instead of 60, and a full
+    profile every 5 hours — a tenth of the request rate of sampling every minute,
+    for the same eventual coverage.
+
+    Rate matters here beyond politeness: these probes deliberately fail against
+    the SAME client_id production uses, so anything that looked like abuse would
+    take production down with it.
+    """
+    return [m for m in range(60) if m % stride == hour % stride]
+
+
+def seconds_until_sweep(stride: int, now: Optional[float] = None) -> float:
+    """Seconds until the next slot in a rotating sweep.
+
+    Walks forward hour by hour rather than assuming the next slot is in the
+    current hour: the last slot of one hour is often followed by a slot early in
+    the next, and the slice changes as the hour rolls over.
+    """
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    frac = now - int(now)
+    for ahead in range(0, 25):
+        hour = (lt.tm_hour + ahead) % 24
+        for m in sweep_minutes_for_hour(stride, hour):
+            # Seconds from `now` to that minute, `ahead` hours out.
+            delta = (ahead * 3600) + ((m - lt.tm_min) * 60) - lt.tm_sec - frac + OVERSHOOT_SECONDS
+            if delta > OVERSHOOT_SECONDS:
+                return delta
+    return 3600.0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -274,6 +344,7 @@ def do_refresh(
     values: dict[str, str],
     scope_mode: str,
     token_file: Path,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     """One refresh exchange, fully instrumented.
 
@@ -285,6 +356,11 @@ def do_refresh(
         "scope_mode": scope_mode,
         "sent_refresh_fp": fingerprint(sent_refresh),
     }
+    # Tag up front so latency scans are identifiable whatever the outcome. A
+    # scan against a dead token 400s on every cycle by design, and those are
+    # exactly the samples the by-minute profile is built from.
+    if read_only:
+        record["read_only"] = True
 
     data = {
         "grant_type": "refresh_token",
@@ -322,6 +398,19 @@ def do_refresh(
 
     # PERSIST FIRST. Everything after this point may throw; the successor must
     # already be durable. This is the whole lesson of the orphaned-token bugs.
+    #
+    # read_only exists for latency scanning against an ALREADY-DEAD token, where
+    # every response is expected to be a 400 and there is nothing to save. But if
+    # one unexpectedly succeeds we must still persist: refusing to write a
+    # successor we have just been handed is precisely how a lineage gets
+    # orphaned, and "I did not think this token was alive" is no defence.
+    if read_only and not new_refresh:
+        record.update(
+            ok=True,
+            returned_refresh_present=False, refresh_rotated=False,
+            expires_in=payload.get("expires_in"), granted_scope=payload.get("scope"),
+        )
+        return record
     persisted = dict(values)
     if new_access:
         persisted["WHOOP_ACCESS_TOKEN"] = new_access
@@ -510,6 +599,37 @@ def analyze(path: Path) -> None:
         else:
             print("    no fatal gap reached yet — the ladder has not found the ceiling")
 
+    # Latency-by-minute profile. The whole point of the scan is a picture of
+    # what happens around the top of the hour, so draw it rather than making
+    # the reader reconstruct it from a column of numbers.
+    scans = [r for r in records if r.get("read_only")]
+    if scans:
+        import statistics as _st
+        by_min: dict[int, list[int]] = {}
+        for r in scans:
+            minute = int(r["ts"][14:16])
+            if r.get("latency_ms") is not None:
+                by_min.setdefault(minute, []).append(r["latency_ms"])
+        allv = [v for vs in by_min.values() for v in vs]
+        scale = max(allv) if allv else 1
+        print("\n  TOKEN-ENDPOINT LATENCY BY MINUTE OF HOUR")
+        print(f"    (n={len(scans)} samples, read-only, no grant consumed)")
+        print()
+        # Order so the hour boundary reads left-to-right: :58 :59 :00 :01 :02
+        order = sorted(by_min, key=lambda m: (m - 30) % 60)
+        for m in order:
+            vs = by_min[m]
+            med = int(_st.median(vs))
+            bar = "#" * max(1, round(med / scale * 46))
+            mark = "  <-- top of hour" if m == 0 else ""
+            print(f"    :{m:02d}  {med:>6}ms  n={len(vs):<3} {bar}{mark}")
+        if 0 in by_min:
+            others = [v for m, vs in by_min.items() if m != 0 for v in vs]
+            if others:
+                ratio = _st.median(by_min[0]) / _st.median(others)
+                print()
+                print(f"    :00 is {ratio:.1f}x the median of every other minute sampled")
+
     print("\n  VERDICT")
     if no_successor and not rotated:
         print("    WHOOP never returned a successor refresh token. The token on")
@@ -537,6 +657,29 @@ def main() -> None:
                         help="Isolated token file. Never Alix's production file.")
     parser.add_argument("--interval", type=int, default=900,
                         help="Seconds between refreshes (default 900 = 15 min).")
+    parser.add_argument("--burst", metavar="FROM:TO:EVERY",
+                        help="One high-resolution pass across a boundary, in seconds relative "
+                             "to the top of the hour: '-60:120:5' fires every 5s from :59:00 "
+                             "to :01:00. Resolves the shape INSIDE the spike minute, which "
+                             "per-minute sampling cannot — a queue clearing in 20s and one "
+                             "clearing in 55s look identical at 1/min. Read-only only.")
+    parser.add_argument("--sweep", type=int, metavar="STRIDE",
+                        help="Rotating sweep: each hour samples the minutes where "
+                             "m %% STRIDE == hour %% STRIDE, so every minute is covered "
+                             "once every STRIDE hours at 60/STRIDE requests per hour. "
+                             "STRIDE 5 gives a full-hour profile every 5 hours for a "
+                             "fifth of the traffic of sampling every minute.")
+    parser.add_argument("--at-minutes", metavar="MINS",
+                        help="Fire at each listed minute past the hour, every hour, "
+                             "e.g. '57,58,59,0,1,2,3'. Builds a latency profile across "
+                             "the hour boundary. Combine with --read-only for a dead "
+                             "token (free, unlimited) or leave it off for a live grant "
+                             "(real refreshes, rotates each time).")
+    parser.add_argument("--read-only", action="store_true",
+                        help="Never persist a rotation; expect 400s and keep going. For "
+                             "profiling the endpoint with an ALREADY-DEAD token, which "
+                             "costs no grant. A successor is still persisted if one "
+                             "unexpectedly arrives — dropping it would orphan the lineage.")
     parser.add_argument("--at-minute", type=int, metavar="M",
                         help="Refresh hourly at exactly HH:MM:00 (0-59). Tests whether "
                              "the minute-of-hour matters: every slow WHOOP call in 14 "
@@ -575,6 +718,35 @@ def main() -> None:
     if not args.token_file:
         parser.error("--token-file is required (or use --analyze)")
 
+    burst = None
+    if args.burst:
+        try:
+            a, b, c = (int(x) for x in args.burst.split(":"))
+        except ValueError:
+            parser.error("--burst must be FROM:TO:EVERY in seconds, e.g. '-60:120:5'")
+        if c < 2: parser.error("--burst interval must be at least 2 seconds")
+        if b <= a: parser.error("--burst TO must be after FROM")
+        if not args.read_only:
+            parser.error("--burst requires --read-only: it fires far too often for a live grant")
+        burst = (a, b, c)
+
+    if args.sweep is not None:
+        if not (1 <= args.sweep <= 60) or 60 % args.sweep != 0:
+            parser.error("--sweep must be a divisor of 60 (e.g. 2, 3, 4, 5, 6, 10, 12)")
+        if args.at_minutes or args.at_minute is not None or args.ladder:
+            parser.error("--sweep cannot be combined with --at-minutes/--at-minute/--ladder")
+
+    scan_minutes: list[int] = []
+    if args.at_minutes:
+        try:
+            scan_minutes = sorted({int(x.strip()) for x in args.at_minutes.split(",") if x.strip()})
+        except ValueError:
+            parser.error("--at-minutes must be comma-separated minutes, e.g. '58,59,0,1,2'")
+        if not scan_minutes or not all(0 <= m <= 59 for m in scan_minutes):
+            parser.error("--at-minutes values must be between 0 and 59")
+        if args.at_minute is not None or args.ladder:
+            parser.error("--at-minutes cannot be combined with --at-minute or --ladder")
+
     if args.at_minute is not None and not (0 <= args.at_minute <= 59):
         parser.error("--at-minute must be between 0 and 59")
     if args.at_minute is not None and args.ladder:
@@ -609,6 +781,22 @@ def main() -> None:
         print(f"[probe] purpose    : find the idle gap at which the lineage dies.")
         print(f"[probe]              every successful cycle raises the proven-safe floor;")
         print(f"[probe]              the first failure is the ceiling.")
+    elif burst:
+        a, b, c = burst
+        n = (b - a) // c + 1
+        print(f"[probe] burst      : every {c}s from {a:+d}s to {b:+d}s around the hour ({n} samples)")
+        print("[probe] mode       : READ-ONLY — expects 400s, consumes no grant")
+    elif args.sweep is not None:
+        per_hour = 60 // args.sweep
+        print(f"[probe] schedule   : rotating sweep, {per_hour} samples/hour, "
+              f"every minute covered every {args.sweep}h ({per_hour * 24}/day)")
+        print("[probe] mode       : " + ("READ-ONLY — expects 400s, consumes no grant"
+                                         if args.read_only else "LIVE"))
+    elif scan_minutes:
+        print(f"[probe] schedule   : minutes {','.join(str(m) for m in scan_minutes)} of every hour")
+        print("[probe] mode       : " + ("READ-ONLY — expects 400s, consumes no grant"
+                                         if args.read_only else
+                                         "LIVE — real refreshes, rotates the grant each cycle"))
     elif args.at_minute is not None:
         print(f"[probe] schedule   : hourly at :{args.at_minute:02d}:00 (24 refreshes/day)")
         print(f"[probe] purpose    : does the minute-of-hour drive the 502s?")
@@ -617,9 +805,53 @@ def main() -> None:
               f"  (~{round(86400 / args.interval)} refreshes/day)")
     print()
 
+    # Read-only arms dispatch each cycle to a worker so a slow call cannot eat
+    # the slots behind it. This is a correctness fix, not merely coverage: an
+    # overrunning call swallows exactly the samples that follow it -- the ones
+    # measuring how fast the endpoint recovers -- so the samples that survive
+    # are biased towards looking healthy.
+    #
+    # A LIVE grant must never take this path. Refresh-token rotation makes
+    # concurrent refreshes the precise race that orphans a lineage, so the gate
+    # is --read-only and nothing else.
+    async_cycles = bool(args.read_only)
+    log_lock = threading.Lock()
+    pool = ThreadPoolExecutor(max_workers=24, thread_name_prefix="probe") if async_cycles else None
+
+    def run_cycle_async(cycle_no: int, values: dict, gap: Optional[int],
+                        fired: Optional[float]) -> None:
+        try:
+            control = do_control_probe(values.get("WHOOP_ACCESS_TOKEN", "")) \
+                if args.control_probe else None
+            expired_before = access_token_expired(values)
+            record = do_refresh(values, args.scope_mode, token_file, read_only=True)
+            record["cycle"] = cycle_no
+            record["access_token_expired_before"] = expired_before
+            if control is not None:
+                record["control_probe"] = control
+            record["idle_gap_minutes_before"] = None if gap is None else round(gap / 60)
+            record["fire_offset_ms"] = None if fired is None else round((fired % 60) * 1000)
+            # The instant the cycle WOKE. `ts` is stamped after the control
+            # probe, which is itself slow near the boundary, so `ts` is not a
+            # safe basis for distance-from-the-hour analysis.
+            record["fired_ts"] = (
+                None if fired is None
+                else datetime.fromtimestamp(fired, timezone.utc).isoformat()
+            )
+            line = json.dumps(record) + "\n"
+            # Workers overlap by design, so the append must be serialised.
+            with log_lock:
+                with open(log_path, "a") as fh:
+                    fh.write(line)
+            print(describe(record, cycle_no), flush=True)
+        except Exception as err:  # noqa: BLE001 - a dead worker must not be silent
+            print(f"[probe] cycle {cycle_no} worker failed: "
+                  f"{type(err).__name__}: {err}", flush=True)
+
     with ProbeLock(token_file):
         cycle = 0
         gap_before: Optional[int] = None
+        fired_at: Optional[float] = None
         while True:
             cycle += 1
             values = dict(dotenv_values(token_file))
@@ -627,43 +859,57 @@ def main() -> None:
                 print("[probe] no WHOOP_REFRESH_TOKEN in token file — re-auth needed.")
                 break
 
-            # Control FIRST, while the connection is as cold as the refresh
-            # about to follow it. Ordering matters: run it after the refresh and
-            # it would reuse a freshly-warmed path and prove nothing.
-            control = do_control_probe(values.get("WHOOP_ACCESS_TOKEN", "")) \
-                if args.control_probe else None
-            expired_before = access_token_expired(values)
+            if async_cycles:
+                pool.submit(run_cycle_async, cycle, values, gap_before, fired_at)
+            else:
+                # Control FIRST, while the connection is as cold as the refresh
+                # about to follow it. Ordering matters: run it after the refresh and
+                # it would reuse a freshly-warmed path and prove nothing.
+                control = do_control_probe(values.get("WHOOP_ACCESS_TOKEN", "")) \
+                    if args.control_probe else None
+                expired_before = access_token_expired(values)
 
-            # The exchange and its persist are one indivisible unit.
-            with DeferredSignals() as sigs:
-                record = do_refresh(values, args.scope_mode, token_file)
-                record["cycle"] = cycle
-                record["access_token_expired_before"] = expired_before
-                if control is not None:
-                    record["control_probe"] = control
-                # The independent variable of the ladder experiment: how long
-                # the token sat idle before this refresh. Recorded on the cycle
-                # it *precedes* so a failure names the gap that killed it.
-                record["idle_gap_minutes_before"] = (
-                    None if gap_before is None else round(gap_before / 60)
-                )
-                if record.get("ok") and args.api_check:
-                    fresh = dict(dotenv_values(token_file))
-                    record["api_check"] = do_api_check(fresh.get("WHOOP_ACCESS_TOKEN", ""))
-                with open(log_path, "a") as fh:
-                    fh.write(json.dumps(record) + "\n")
+                # The exchange and its persist are one indivisible unit.
+                with DeferredSignals() as sigs:
+                    record = do_refresh(values, args.scope_mode, token_file,
+                                        read_only=args.read_only)
+                    record["cycle"] = cycle
+                    record["access_token_expired_before"] = expired_before
+                    if control is not None:
+                        record["control_probe"] = control
+                    # The independent variable of the ladder experiment: how long
+                    # the token sat idle before this refresh. Recorded on the cycle
+                    # it *precedes* so a failure names the gap that killed it.
+                    record["idle_gap_minutes_before"] = (
+                        None if gap_before is None else round(gap_before / 60)
+                    )
+                    # Milliseconds past the minute boundary at which the cycle WOKE
+                    # -- captured before the control probe and the refresh, or it
+                    # would measure their duration instead of the timer's accuracy.
+                    record["fire_offset_ms"] = (
+                        None if fired_at is None else round((fired_at % 60) * 1000)
+                    )
+                    record["fired_ts"] = (
+                        None if fired_at is None
+                        else datetime.fromtimestamp(fired_at, timezone.utc).isoformat()
+                    )
+                    if record.get("ok") and args.api_check:
+                        fresh = dict(dotenv_values(token_file))
+                        record["api_check"] = do_api_check(fresh.get("WHOOP_ACCESS_TOKEN", ""))
+                    with open(log_path, "a") as fh:
+                        fh.write(json.dumps(record) + "\n")
 
-            print(describe(record, cycle), flush=True)
+                print(describe(record, cycle), flush=True)
 
-            if sigs.received:
-                print("[probe] exiting on deferred signal.")
-                break
-            if not record.get("ok") and args.stop_on_failure:
-                print("\n[probe] refresh failed — stopping so the failure state is "
-                      "preserved for inspection.")
-                print(f"[probe] summarise with:\n"
-                      f"  uv run python scripts/refresh-probe.py --analyze {log_path}")
-                break
+                if sigs.received:
+                    print("[probe] exiting on deferred signal.")
+                    break
+                if not record.get("ok") and args.stop_on_failure and not args.read_only:
+                    print("\n[probe] refresh failed — stopping so the failure state is "
+                          "preserved for inspection.")
+                    print(f"[probe] summarise with:\n"
+                          f"  uv run python scripts/refresh-probe.py --analyze {log_path}")
+                    break
             if args.once:
                 break
             if args.max_cycles and cycle >= args.max_cycles:
@@ -673,8 +919,42 @@ def main() -> None:
             # Ladder: use each gap once, then hold at the last (largest) value.
             # A successful cycle proves that gap is survivable; the first
             # failure brackets the boundary between it and the prior gap.
-            if args.at_minute is not None:
-                gap_before = round(seconds_until_minute(args.at_minute))
+            target_epoch = None
+            if burst:
+                a, b, c = burst
+                now = time.time()
+                lt = time.localtime(now)
+                # Seconds to the next top-of-hour, then walk the offset ladder.
+                secs_into = (lt.tm_min * 60 + lt.tm_sec) + (now - int(now))
+                to_hour = 3600 - secs_into
+                offsets = list(range(a, b + 1, c))
+                # Anchor on whichever boundary the window still reaches. Once the
+                # clock passes :00, the boundary we care about is behind us, so
+                # its positive offsets are the ones still to fire -- measuring
+                # only to_hour restarts the ladder at FROM and loses every
+                # post-boundary sample, which is the whole drain curve.
+                cands = [base + o
+                         for base in (-secs_into, to_hour)
+                         for o in offsets
+                         if base + o > 0.4]
+                nxt = min(cands) if cands else to_hour + 3600 + offsets[0]
+                target_epoch = now + nxt
+                gap_before = math.ceil(nxt)
+                if gap_before > 90:
+                    print(f"[probe] waiting {gap_before}s for the boundary window", flush=True)
+            elif args.sweep is not None:
+                gap_before = math.ceil(seconds_until_sweep(args.sweep))
+                target_epoch = time.time() + seconds_until_sweep(args.sweep)
+                print(f"[probe] next sweep sample in {gap_before}s", flush=True)
+            elif scan_minutes:
+                waits = [seconds_until_minute(m) for m in scan_minutes]
+                gap_before = math.ceil(min(waits))
+                target_epoch = time.time() + min(waits)
+                nxt = scan_minutes[waits.index(min(waits))]
+                print(f"[probe] next scan at :{nxt:02d} ({gap_before}s)", flush=True)
+            elif args.at_minute is not None:
+                gap_before = math.ceil(seconds_until_minute(args.at_minute))
+                target_epoch = time.time() + seconds_until_minute(args.at_minute)
                 print(f"[probe] sleeping {gap_before}s until :{args.at_minute:02d}:00", flush=True)
             elif ladder:
                 gap_before = ladder[cycle - 1] if cycle - 1 < len(ladder) else ladder[-1]
@@ -685,10 +965,20 @@ def main() -> None:
                 gap_before = args.interval
 
             try:
-                time.sleep(gap_before)
+                if target_epoch is not None:
+                    sleep_until(target_epoch)
+                else:
+                    time.sleep(gap_before)
+                fired_at = time.time()
             except KeyboardInterrupt:
                 print("\n[probe] interrupted while idle — safe to stop.")
                 break
+
+        # Let dispatched cycles finish before the summary reads the log, or the
+        # last few samples are counted as missing rather than merely in flight.
+        if pool is not None:
+            print("[probe] draining in-flight cycles...", flush=True)
+            pool.shutdown(wait=True)
 
     print()
     analyze(log_path)
