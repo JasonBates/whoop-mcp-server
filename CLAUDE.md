@@ -3,6 +3,8 @@
 ## Overview
 A FastMCP server that exposes WHOOP fitness data (recovery, sleep, strain, workouts) to Claude Desktop via the Model Context Protocol.
 
+**Status (7 October 2026):** not registered in Claude Code (`~/.claude.json`) or Claude Desktop config; the WHOOP server in use is `whoop-ts` from `~/CODE/repos/whoop-mcp-ts`.
+
 ## Architecture
 
 ```
